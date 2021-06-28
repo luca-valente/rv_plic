@@ -15,343 +15,1703 @@
 //   N_SOURCE: Number of interrupt sources
 //   N_TARGET: Number of interrupt targets (#receptor)
 //   MAX_PRIO: Maximum value of interrupt priority
-//   SRCW:     Do not specify this parameter. It is bit width to cover MAX_ID+1
 
 module rv_plic #(
-  parameter int N_SOURCE    = 32,
-  parameter int N_TARGET    = 1,
-  parameter int MAX_PRIO    = 7,
-  parameter     FIND_MAX    = "SEQUENTIAL", // SEQUENTIAL | MATRIX
+    parameter int N_SOURCE    = 256,
+    parameter int N_TARGET    = 2,
+    parameter     FIND_MAX    = "SEQUENTIAL", // SEQUENTIAL | MATRIX
 
-  // Local param (Do not change this through parameter)
-  parameter int SRCW        = $clog2(N_SOURCE+1)
+    parameter int SRCW       = $clog2(N_SOURCE+1)  // derived parameter
 ) (
-  input     clk_i,
-  input     rst_ni,
+    input     clk_i,
+    input     rst_ni,
 
-  // Bus Interface (device)
-  input  tlul_pkg::tl_h2d_t tl_i,
-  output tlul_pkg::tl_d2h_t tl_o,
+    // Bus Interface (device)
+    input  tlul_pkg::tl_h2d_t tl_i,
+    output tlul_pkg::tl_d2h_t tl_o,
 
-  // Interrupt Sources
-  input [N_SOURCE-1:0] intr_src_i,
+    // Interrupt Sources
+    input  [N_SOURCE-1:0] intr_src_i,
 
-  // Interrupt notification to targets
-  output            irq_o    [N_TARGET],
-  output [SRCW-1:0] irq_id_o [N_TARGET]
+    // Interrupt notification to targets
+    output [N_TARGET-1:0] irq_o,
+    output [SRCW-1:0]     irq_id_o [N_TARGET]
 );
 
-import rv_plic_reg_pkg::*;
+  import rv_plic_reg_pkg::*;
 
-rv_plic_reg2hw_t reg2hw;
-rv_plic_hw2reg_t hw2reg;
+  rv_plic_reg2hw_t reg2hw;
+  rv_plic_hw2reg_t hw2reg;
 
-localparam PRIOW = $clog2(MAX_PRIO+1);
+  localparam int MAX_PRIO    = 7;
+  localparam int PRIOW = $clog2(MAX_PRIO+1);
 
-logic [N_SOURCE-1:0] le; // 0:level 1:edge
-logic [N_SOURCE-1:0] ip;
+  logic [N_SOURCE-1:0] le; // 0:level 1:edge
+  logic [N_SOURCE-1:0] ip;
 
-logic [N_SOURCE-1:0] ie [N_TARGET];
+  logic [N_SOURCE-1:0] ie [N_TARGET];
 
-logic                claim_re [N_TARGET]; // Target read indicator
-logic [SRCW-1:0]     claim_id [N_TARGET];
-logic [N_SOURCE-1:0] claim ; // Converted from claim_re/claim_id
+  logic [N_TARGET-1:0] claim_re; // Target read indicator
+  logic [SRCW-1:0]     claim_id [N_TARGET];
+  logic [N_SOURCE-1:0] claim; // Converted from claim_re/claim_id
 
-logic                complete_we [N_TARGET]; // Target write indicator
-logic [SRCW-1:0]     complete_id [N_TARGET];
-logic [N_SOURCE-1:0] complete ; // Converted from complete_re/complete_id
+  logic [N_TARGET-1:0] complete_we; // Target write indicator
+  logic [SRCW-1:0]     complete_id [N_TARGET];
+  logic [N_SOURCE-1:0] complete; // Converted from complete_re/complete_id
 
-logic [SRCW-1:0]     cc_id [N_TARGET]; // Write ID
+  logic [SRCW-1:0]     cc_id [N_TARGET]; // Write ID
 
-logic [PRIOW-1:0] prio [N_SOURCE];
+  logic [PRIOW-1:0] prio [N_SOURCE];
 
-logic [PRIOW-1:0] threshold [N_TARGET];
+  logic [PRIOW-1:0] threshold [N_TARGET];
 
-// Glue logic between rv_plic_reg_top and others
-assign cc_id = irq_id_o;
+  // Glue logic between rv_plic_reg_top and others
+  assign cc_id = irq_id_o;
 
-always_comb begin
-  claim = '0;
-  for (int i = 0 ; i < N_TARGET ; i++) begin
-    if (claim_re[i]) claim[claim_id[i] -1] = 1'b1;
+  always_comb begin
+    claim = '0;
+    for (int i = 0 ; i < N_TARGET ; i++) begin
+      if (claim_re[i]) claim[claim_id[i] -1] = 1'b1;
+    end
   end
-end
-always_comb begin
-  complete = '0;
-  for (int i = 0 ; i < N_TARGET ; i++) begin
-    if (complete_we[i]) complete[complete_id[i] -1] = 1'b1;
+  always_comb begin
+    complete = '0;
+    for (int i = 0 ; i < N_TARGET ; i++) begin
+      if (complete_we[i]) complete[complete_id[i] -1] = 1'b1;
+    end
   end
-end
 
-`ifndef VERILATOR
-//sequence pulse_seq (sig);
-//  sig ##1 ~sig;
-//endsequence
+  //`ASSERT_PULSE(claimPulse, claim_re[i], clk_i, !rst_ni)
+  //`ASSERT_PULSE(completePulse, complete_we[i], clk_i, !rst_ni)
 
-property pulse_prop (sig);
-  @(posedge clk_i)
-    sig |=> ##1 ~sig;
-endproperty
+  `ASSERT(onehot0Claim, $onehot0(claim_re), clk_i, !rst_ni)
 
-//claim_pulse_assert:    assert property (pulse_prop(claim_re[i]));
-//complete_pulse_assert: assert property (pulse_prop(complete_we[i]));
-onehot0_claim_assert:    assert property (
-  @(posedge clk_i) disable iff (!rst_ni)
-    $onehot0(claim_re)
-);
-onehot0_complete_assert: assert property (
-  @(posedge clk_i) disable iff (!rst_ni)
-    $onehot0(complete_we)
-);
-`endif // VERILATOR
+  `ASSERT(onehot0Complete, $onehot0(complete_we), clk_i, !rst_ni)
 
-//pragma translate_off
-if(SRCW != $clog2(N_SOURCE+1)) $fatal("SRCW shouldn't be modified");
-//pragma translate_on
+  //////////////////////////////////////////////////////////////////////////////
+  // Priority
+  assign prio[0] = reg2hw.prio0.q;
+  assign prio[1] = reg2hw.prio1.q;
+  assign prio[2] = reg2hw.prio2.q;
+  assign prio[3] = reg2hw.prio3.q;
+  assign prio[4] = reg2hw.prio4.q;
+  assign prio[5] = reg2hw.prio5.q;
+  assign prio[6] = reg2hw.prio6.q;
+  assign prio[7] = reg2hw.prio7.q;
+  assign prio[8] = reg2hw.prio8.q;
+  assign prio[9] = reg2hw.prio9.q;
+  assign prio[10] = reg2hw.prio10.q;
+  assign prio[11] = reg2hw.prio11.q;
+  assign prio[12] = reg2hw.prio12.q;
+  assign prio[13] = reg2hw.prio13.q;
+  assign prio[14] = reg2hw.prio14.q;
+  assign prio[15] = reg2hw.prio15.q;
+  assign prio[16] = reg2hw.prio16.q;
+  assign prio[17] = reg2hw.prio17.q;
+  assign prio[18] = reg2hw.prio18.q;
+  assign prio[19] = reg2hw.prio19.q;
+  assign prio[20] = reg2hw.prio20.q;
+  assign prio[21] = reg2hw.prio21.q;
+  assign prio[22] = reg2hw.prio22.q;
+  assign prio[23] = reg2hw.prio23.q;
+  assign prio[24] = reg2hw.prio24.q;
+  assign prio[25] = reg2hw.prio25.q;
+  assign prio[26] = reg2hw.prio26.q;
+  assign prio[27] = reg2hw.prio27.q;
+  assign prio[28] = reg2hw.prio28.q;
+  assign prio[29] = reg2hw.prio29.q;
+  assign prio[30] = reg2hw.prio30.q;
+  assign prio[31] = reg2hw.prio31.q;
+  assign prio[32] = reg2hw.prio32.q;
+  assign prio[33] = reg2hw.prio33.q;
+  assign prio[34] = reg2hw.prio34.q;
+  assign prio[35] = reg2hw.prio35.q;
+  assign prio[36] = reg2hw.prio36.q;
+  assign prio[37] = reg2hw.prio37.q;
+  assign prio[38] = reg2hw.prio38.q;
+  assign prio[39] = reg2hw.prio39.q;
+  assign prio[40] = reg2hw.prio40.q;
+  assign prio[41] = reg2hw.prio41.q;
+  assign prio[42] = reg2hw.prio42.q;
+  assign prio[43] = reg2hw.prio43.q;
+  assign prio[44] = reg2hw.prio44.q;
+  assign prio[45] = reg2hw.prio45.q;
+  assign prio[46] = reg2hw.prio46.q;
+  assign prio[47] = reg2hw.prio47.q;
+  assign prio[48] = reg2hw.prio48.q;
+  assign prio[49] = reg2hw.prio49.q;
+  assign prio[50] = reg2hw.prio50.q;
+  assign prio[51] = reg2hw.prio51.q;
+  assign prio[52] = reg2hw.prio52.q;
+  assign prio[53] = reg2hw.prio53.q;
+  assign prio[54] = reg2hw.prio54.q;
+  assign prio[55] = reg2hw.prio55.q;
+  assign prio[56] = reg2hw.prio56.q;
+  assign prio[57] = reg2hw.prio57.q;
+  assign prio[58] = reg2hw.prio58.q;
+  assign prio[59] = reg2hw.prio59.q;
+  assign prio[60] = reg2hw.prio60.q;
+  assign prio[61] = reg2hw.prio61.q;
+  assign prio[62] = reg2hw.prio62.q;
+  assign prio[63] = reg2hw.prio63.q;
+  assign prio[64] = reg2hw.prio64.q;
+  assign prio[65] = reg2hw.prio65.q;
+  assign prio[66] = reg2hw.prio66.q;
+  assign prio[67] = reg2hw.prio67.q;
+  assign prio[68] = reg2hw.prio68.q;
+  assign prio[69] = reg2hw.prio69.q;
+  assign prio[70] = reg2hw.prio70.q;
+  assign prio[71] = reg2hw.prio71.q;
+  assign prio[72] = reg2hw.prio72.q;
+  assign prio[73] = reg2hw.prio73.q;
+  assign prio[74] = reg2hw.prio74.q;
+  assign prio[75] = reg2hw.prio75.q;
+  assign prio[76] = reg2hw.prio76.q;
+  assign prio[77] = reg2hw.prio77.q;
+  assign prio[78] = reg2hw.prio78.q;
+  assign prio[79] = reg2hw.prio79.q;
+  assign prio[80] = reg2hw.prio80.q;
+  assign prio[81] = reg2hw.prio81.q;
+  assign prio[82] = reg2hw.prio82.q;
+  assign prio[83] = reg2hw.prio83.q;
+  assign prio[84] = reg2hw.prio84.q;
+  assign prio[85] = reg2hw.prio85.q;
+  assign prio[86] = reg2hw.prio86.q;
+  assign prio[87] = reg2hw.prio87.q;
+  assign prio[88] = reg2hw.prio88.q;
+  assign prio[89] = reg2hw.prio89.q;
+  assign prio[90] = reg2hw.prio90.q;
+  assign prio[91] = reg2hw.prio91.q;
+  assign prio[92] = reg2hw.prio92.q;
+  assign prio[93] = reg2hw.prio93.q;
+  assign prio[94] = reg2hw.prio94.q;
+  assign prio[95] = reg2hw.prio95.q;
+  assign prio[96] = reg2hw.prio96.q;
+  assign prio[97] = reg2hw.prio97.q;
+  assign prio[98] = reg2hw.prio98.q;
+  assign prio[99] = reg2hw.prio99.q;
+  assign prio[100] = reg2hw.prio100.q;
+  assign prio[101] = reg2hw.prio101.q;
+  assign prio[102] = reg2hw.prio102.q;
+  assign prio[103] = reg2hw.prio103.q;
+  assign prio[104] = reg2hw.prio104.q;
+  assign prio[105] = reg2hw.prio105.q;
+  assign prio[106] = reg2hw.prio106.q;
+  assign prio[107] = reg2hw.prio107.q;
+  assign prio[108] = reg2hw.prio108.q;
+  assign prio[109] = reg2hw.prio109.q;
+  assign prio[110] = reg2hw.prio110.q;
+  assign prio[111] = reg2hw.prio111.q;
+  assign prio[112] = reg2hw.prio112.q;
+  assign prio[113] = reg2hw.prio113.q;
+  assign prio[114] = reg2hw.prio114.q;
+  assign prio[115] = reg2hw.prio115.q;
+  assign prio[116] = reg2hw.prio116.q;
+  assign prio[117] = reg2hw.prio117.q;
+  assign prio[118] = reg2hw.prio118.q;
+  assign prio[119] = reg2hw.prio119.q;
+  assign prio[120] = reg2hw.prio120.q;
+  assign prio[121] = reg2hw.prio121.q;
+  assign prio[122] = reg2hw.prio122.q;
+  assign prio[123] = reg2hw.prio123.q;
+  assign prio[124] = reg2hw.prio124.q;
+  assign prio[125] = reg2hw.prio125.q;
+  assign prio[126] = reg2hw.prio126.q;
+  assign prio[127] = reg2hw.prio127.q;
+  assign prio[128] = reg2hw.prio128.q;
+  assign prio[129] = reg2hw.prio129.q;
+  assign prio[130] = reg2hw.prio130.q;
+  assign prio[131] = reg2hw.prio131.q;
+  assign prio[132] = reg2hw.prio132.q;
+  assign prio[133] = reg2hw.prio133.q;
+  assign prio[134] = reg2hw.prio134.q;
+  assign prio[135] = reg2hw.prio135.q;
+  assign prio[136] = reg2hw.prio136.q;
+  assign prio[137] = reg2hw.prio137.q;
+  assign prio[138] = reg2hw.prio138.q;
+  assign prio[139] = reg2hw.prio139.q;
+  assign prio[140] = reg2hw.prio140.q;
+  assign prio[141] = reg2hw.prio141.q;
+  assign prio[142] = reg2hw.prio142.q;
+  assign prio[143] = reg2hw.prio143.q;
+  assign prio[144] = reg2hw.prio144.q;
+  assign prio[145] = reg2hw.prio145.q;
+  assign prio[146] = reg2hw.prio146.q;
+  assign prio[147] = reg2hw.prio147.q;
+  assign prio[148] = reg2hw.prio148.q;
+  assign prio[149] = reg2hw.prio149.q;
+  assign prio[150] = reg2hw.prio150.q;
+  assign prio[151] = reg2hw.prio151.q;
+  assign prio[152] = reg2hw.prio152.q;
+  assign prio[153] = reg2hw.prio153.q;
+  assign prio[154] = reg2hw.prio154.q;
+  assign prio[155] = reg2hw.prio155.q;
+  assign prio[156] = reg2hw.prio156.q;
+  assign prio[157] = reg2hw.prio157.q;
+  assign prio[158] = reg2hw.prio158.q;
+  assign prio[159] = reg2hw.prio159.q;
+  assign prio[160] = reg2hw.prio160.q;
+  assign prio[161] = reg2hw.prio161.q;
+  assign prio[162] = reg2hw.prio162.q;
+  assign prio[163] = reg2hw.prio163.q;
+  assign prio[164] = reg2hw.prio164.q;
+  assign prio[165] = reg2hw.prio165.q;
+  assign prio[166] = reg2hw.prio166.q;
+  assign prio[167] = reg2hw.prio167.q;
+  assign prio[168] = reg2hw.prio168.q;
+  assign prio[169] = reg2hw.prio169.q;
+  assign prio[170] = reg2hw.prio170.q;
+  assign prio[171] = reg2hw.prio171.q;
+  assign prio[172] = reg2hw.prio172.q;
+  assign prio[173] = reg2hw.prio173.q;
+  assign prio[174] = reg2hw.prio174.q;
+  assign prio[175] = reg2hw.prio175.q;
+  assign prio[176] = reg2hw.prio176.q;
+  assign prio[177] = reg2hw.prio177.q;
+  assign prio[178] = reg2hw.prio178.q;
+  assign prio[179] = reg2hw.prio179.q;
+  assign prio[180] = reg2hw.prio180.q;
+  assign prio[181] = reg2hw.prio181.q;
+  assign prio[182] = reg2hw.prio182.q;
+  assign prio[183] = reg2hw.prio183.q;
+  assign prio[184] = reg2hw.prio184.q;
+  assign prio[185] = reg2hw.prio185.q;
+  assign prio[186] = reg2hw.prio186.q;
+  assign prio[187] = reg2hw.prio187.q;
+  assign prio[188] = reg2hw.prio188.q;
+  assign prio[189] = reg2hw.prio189.q;
+  assign prio[190] = reg2hw.prio190.q;
+  assign prio[191] = reg2hw.prio191.q;
+  assign prio[192] = reg2hw.prio192.q;
+  assign prio[193] = reg2hw.prio193.q;
+  assign prio[194] = reg2hw.prio194.q;
+  assign prio[195] = reg2hw.prio195.q;
+  assign prio[196] = reg2hw.prio196.q;
+  assign prio[197] = reg2hw.prio197.q;
+  assign prio[198] = reg2hw.prio198.q;
+  assign prio[199] = reg2hw.prio199.q;
+  assign prio[200] = reg2hw.prio200.q;
+  assign prio[201] = reg2hw.prio201.q;
+  assign prio[202] = reg2hw.prio202.q;
+  assign prio[203] = reg2hw.prio203.q;
+  assign prio[204] = reg2hw.prio204.q;
+  assign prio[205] = reg2hw.prio205.q;
+  assign prio[206] = reg2hw.prio206.q;
+  assign prio[207] = reg2hw.prio207.q;
+  assign prio[208] = reg2hw.prio208.q;
+  assign prio[209] = reg2hw.prio209.q;
+  assign prio[210] = reg2hw.prio210.q;
+  assign prio[211] = reg2hw.prio211.q;
+  assign prio[212] = reg2hw.prio212.q;
+  assign prio[213] = reg2hw.prio213.q;
+  assign prio[214] = reg2hw.prio214.q;
+  assign prio[215] = reg2hw.prio215.q;
+  assign prio[216] = reg2hw.prio216.q;
+  assign prio[217] = reg2hw.prio217.q;
+  assign prio[218] = reg2hw.prio218.q;
+  assign prio[219] = reg2hw.prio219.q;
+  assign prio[220] = reg2hw.prio220.q;
+  assign prio[221] = reg2hw.prio221.q;
+  assign prio[222] = reg2hw.prio222.q;
+  assign prio[223] = reg2hw.prio223.q;
+  assign prio[224] = reg2hw.prio224.q;
+  assign prio[225] = reg2hw.prio225.q;
+  assign prio[226] = reg2hw.prio226.q;
+  assign prio[227] = reg2hw.prio227.q;
+  assign prio[228] = reg2hw.prio228.q;
+  assign prio[229] = reg2hw.prio229.q;
+  assign prio[230] = reg2hw.prio230.q;
+  assign prio[231] = reg2hw.prio231.q;
+  assign prio[232] = reg2hw.prio232.q;
+  assign prio[233] = reg2hw.prio233.q;
+  assign prio[234] = reg2hw.prio234.q;
+  assign prio[235] = reg2hw.prio235.q;
+  assign prio[236] = reg2hw.prio236.q;
+  assign prio[237] = reg2hw.prio237.q;
+  assign prio[238] = reg2hw.prio238.q;
+  assign prio[239] = reg2hw.prio239.q;
+  assign prio[240] = reg2hw.prio240.q;
+  assign prio[241] = reg2hw.prio241.q;
+  assign prio[242] = reg2hw.prio242.q;
+  assign prio[243] = reg2hw.prio243.q;
+  assign prio[244] = reg2hw.prio244.q;
+  assign prio[245] = reg2hw.prio245.q;
+  assign prio[246] = reg2hw.prio246.q;
+  assign prio[247] = reg2hw.prio247.q;
+  assign prio[248] = reg2hw.prio248.q;
+  assign prio[249] = reg2hw.prio249.q;
+  assign prio[250] = reg2hw.prio250.q;
+  assign prio[251] = reg2hw.prio251.q;
+  assign prio[252] = reg2hw.prio252.q;
+  assign prio[253] = reg2hw.prio253.q;
+  assign prio[254] = reg2hw.prio254.q;
+  assign prio[255] = reg2hw.prio255.q;
+  //----------------------------------------------------------------------------
 
-////////////////////////////////////////////////////////////////////////////////
-// PRIORITY : Need to connect manually
-assign prio[ 0] = reg2hw.prio0.q;
-assign prio[ 1] = reg2hw.prio1.q;
-assign prio[ 2] = reg2hw.prio2.q;
-assign prio[ 3] = reg2hw.prio3.q;
-assign prio[ 4] = reg2hw.prio4.q;
-assign prio[ 5] = reg2hw.prio5.q;
-assign prio[ 6] = reg2hw.prio6.q;
-assign prio[ 7] = reg2hw.prio7.q;
-assign prio[ 8] = reg2hw.prio8.q;
-assign prio[ 9] = reg2hw.prio9.q;
-assign prio[10] = reg2hw.prio10.q;
-assign prio[11] = reg2hw.prio11.q;
-assign prio[12] = reg2hw.prio12.q;
-assign prio[13] = reg2hw.prio13.q;
-assign prio[14] = reg2hw.prio14.q;
-assign prio[15] = reg2hw.prio15.q;
-assign prio[16] = reg2hw.prio16.q;
-assign prio[17] = reg2hw.prio17.q;
-assign prio[18] = reg2hw.prio18.q;
-assign prio[19] = reg2hw.prio19.q;
-assign prio[20] = reg2hw.prio20.q;
-assign prio[21] = reg2hw.prio21.q;
-assign prio[22] = reg2hw.prio22.q;
-assign prio[23] = reg2hw.prio23.q;
-assign prio[24] = reg2hw.prio24.q;
-assign prio[25] = reg2hw.prio25.q;
-assign prio[26] = reg2hw.prio26.q;
-assign prio[27] = reg2hw.prio27.q;
-assign prio[28] = reg2hw.prio28.q;
-assign prio[29] = reg2hw.prio29.q;
-assign prio[30] = reg2hw.prio30.q;
-assign prio[31] = reg2hw.prio31.q;
-//------------------------------------------------------------------------------
+  //////////////////////////////////////////////////////////////////////////////
+  // Interrupt Enable
+  assign ie[0][0] = reg2hw.ie0.e0.q;
+  assign ie[0][1] = reg2hw.ie0.e1.q;
+  assign ie[0][2] = reg2hw.ie0.e2.q;
+  assign ie[0][3] = reg2hw.ie0.e3.q;
+  assign ie[0][4] = reg2hw.ie0.e4.q;
+  assign ie[0][5] = reg2hw.ie0.e5.q;
+  assign ie[0][6] = reg2hw.ie0.e6.q;
+  assign ie[0][7] = reg2hw.ie0.e7.q;
+  assign ie[0][8] = reg2hw.ie0.e8.q;
+  assign ie[0][9] = reg2hw.ie0.e9.q;
+  assign ie[0][10] = reg2hw.ie0.e10.q;
+  assign ie[0][11] = reg2hw.ie0.e11.q;
+  assign ie[0][12] = reg2hw.ie0.e12.q;
+  assign ie[0][13] = reg2hw.ie0.e13.q;
+  assign ie[0][14] = reg2hw.ie0.e14.q;
+  assign ie[0][15] = reg2hw.ie0.e15.q;
+  assign ie[0][16] = reg2hw.ie0.e16.q;
+  assign ie[0][17] = reg2hw.ie0.e17.q;
+  assign ie[0][18] = reg2hw.ie0.e18.q;
+  assign ie[0][19] = reg2hw.ie0.e19.q;
+  assign ie[0][20] = reg2hw.ie0.e20.q;
+  assign ie[0][21] = reg2hw.ie0.e21.q;
+  assign ie[0][22] = reg2hw.ie0.e22.q;
+  assign ie[0][23] = reg2hw.ie0.e23.q;
+  assign ie[0][24] = reg2hw.ie0.e24.q;
+  assign ie[0][25] = reg2hw.ie0.e25.q;
+  assign ie[0][26] = reg2hw.ie0.e26.q;
+  assign ie[0][27] = reg2hw.ie0.e27.q;
+  assign ie[0][28] = reg2hw.ie0.e28.q;
+  assign ie[0][29] = reg2hw.ie0.e29.q;
+  assign ie[0][30] = reg2hw.ie0.e30.q;
+  assign ie[0][31] = reg2hw.ie0.e31.q;
+  assign ie[0][32] = reg2hw.ie0.e32.q;
+  assign ie[0][33] = reg2hw.ie01.e1.q;
+  assign ie[0][34] = reg2hw.ie01.e2.q;
+  assign ie[0][35] = reg2hw.ie01.e3.q;
+  assign ie[0][36] = reg2hw.ie01.e4.q;
+  assign ie[0][37] = reg2hw.ie01.e5.q;
+  assign ie[0][38] = reg2hw.ie01.e6.q;
+  assign ie[0][39] = reg2hw.ie01.e7.q;
+  assign ie[0][40] = reg2hw.ie01.e8.q;
+  assign ie[0][41] = reg2hw.ie01.e9.q;
+  assign ie[0][42] = reg2hw.ie01.e10.q;
+  assign ie[0][43] = reg2hw.ie01.e11.q;
+  assign ie[0][44] = reg2hw.ie01.e12.q;
+  assign ie[0][45] = reg2hw.ie01.e13.q;
+  assign ie[0][46] = reg2hw.ie01.e14.q;
+  assign ie[0][47] = reg2hw.ie01.e15.q;
+  assign ie[0][48] = reg2hw.ie01.e16.q;
+  assign ie[0][49] = reg2hw.ie01.e17.q;
+  assign ie[0][50] = reg2hw.ie01.e18.q;
+  assign ie[0][51] = reg2hw.ie01.e19.q;
+  assign ie[0][52] = reg2hw.ie01.e20.q;
+  assign ie[0][53] = reg2hw.ie01.e21.q;
+  assign ie[0][54] = reg2hw.ie01.e22.q;
+  assign ie[0][55] = reg2hw.ie01.e23.q;
+  assign ie[0][56] = reg2hw.ie01.e24.q;
+  assign ie[0][57] = reg2hw.ie01.e25.q;
+  assign ie[0][58] = reg2hw.ie01.e26.q;
+  assign ie[0][59] = reg2hw.ie01.e27.q;
+  assign ie[0][60] = reg2hw.ie01.e28.q;
+  assign ie[0][61] = reg2hw.ie01.e29.q;
+  assign ie[0][62] = reg2hw.ie01.e30.q;
+  assign ie[0][63] = reg2hw.ie01.e31.q;
+  assign ie[0][64] = reg2hw.ie02.e0.q;
+  assign ie[0][65] = reg2hw.ie02.e1.q;
+  assign ie[0][66] = reg2hw.ie02.e2.q;
+  assign ie[0][67] = reg2hw.ie02.e3.q;
+  assign ie[0][68] = reg2hw.ie02.e4.q;
+  assign ie[0][69] = reg2hw.ie02.e5.q;
+  assign ie[0][70] = reg2hw.ie02.e6.q;
+  assign ie[0][71] = reg2hw.ie02.e7.q;
+  assign ie[0][72] = reg2hw.ie02.e8.q;
+  assign ie[0][73] = reg2hw.ie02.e9.q;
+  assign ie[0][74] = reg2hw.ie02.e10.q;
+  assign ie[0][75] = reg2hw.ie02.e11.q;
+  assign ie[0][76] = reg2hw.ie02.e12.q;
+  assign ie[0][77] = reg2hw.ie02.e13.q;
+  assign ie[0][78] = reg2hw.ie02.e14.q;
+  assign ie[0][79] = reg2hw.ie02.e15.q;
+  assign ie[0][80] = reg2hw.ie02.e16.q;
+  assign ie[0][81] = reg2hw.ie02.e17.q;
+  assign ie[0][82] = reg2hw.ie02.e18.q;
+  assign ie[0][83] = reg2hw.ie02.e19.q;
+  assign ie[0][84] = reg2hw.ie02.e20.q;
+  assign ie[0][85] = reg2hw.ie02.e21.q;
+  assign ie[0][86] = reg2hw.ie02.e22.q;
+  assign ie[0][87] = reg2hw.ie02.e23.q;
+  assign ie[0][88] = reg2hw.ie02.e24.q;
+  assign ie[0][89] = reg2hw.ie02.e25.q;
+  assign ie[0][90] = reg2hw.ie02.e26.q;
+  assign ie[0][91] = reg2hw.ie02.e27.q;
+  assign ie[0][92] = reg2hw.ie02.e28.q;
+  assign ie[0][93] = reg2hw.ie02.e29.q;
+  assign ie[0][94] = reg2hw.ie02.e30.q;
+  assign ie[0][95] = reg2hw.ie02.e31.q;
+  assign ie[0][96] = reg2hw.ie03.e0.q;
+  assign ie[0][97] = reg2hw.ie03.e1.q;
+  assign ie[0][98] = reg2hw.ie03.e2.q;
+  assign ie[0][99] = reg2hw.ie03.e3.q;
+  assign ie[0][100] = reg2hw.ie03.e4.q;
+  assign ie[0][101] = reg2hw.ie03.e5.q;
+  assign ie[0][102] = reg2hw.ie03.e6.q;
+  assign ie[0][103] = reg2hw.ie03.e7.q;
+  assign ie[0][104] = reg2hw.ie03.e8.q;
+  assign ie[0][105] = reg2hw.ie03.e9.q;
+  assign ie[0][106] = reg2hw.ie03.e10.q;
+  assign ie[0][107] = reg2hw.ie03.e11.q;
+  assign ie[0][108] = reg2hw.ie03.e12.q;
+  assign ie[0][109] = reg2hw.ie03.e13.q;
+  assign ie[0][110] = reg2hw.ie03.e14.q;
+  assign ie[0][111] = reg2hw.ie03.e15.q;
+  assign ie[0][112] = reg2hw.ie03.e16.q;
+  assign ie[0][113] = reg2hw.ie03.e17.q;
+  assign ie[0][114] = reg2hw.ie03.e18.q;
+  assign ie[0][115] = reg2hw.ie03.e19.q;
+  assign ie[0][116] = reg2hw.ie03.e20.q;
+  assign ie[0][117] = reg2hw.ie03.e21.q;
+  assign ie[0][118] = reg2hw.ie03.e22.q;
+  assign ie[0][119] = reg2hw.ie03.e23.q;
+  assign ie[0][120] = reg2hw.ie03.e24.q;
+  assign ie[0][121] = reg2hw.ie03.e25.q;
+  assign ie[0][122] = reg2hw.ie03.e26.q;
+  assign ie[0][123] = reg2hw.ie03.e27.q;
+  assign ie[0][124] = reg2hw.ie03.e28.q;
+  assign ie[0][125] = reg2hw.ie03.e29.q;
+  assign ie[0][126] = reg2hw.ie03.e30.q;
+  assign ie[0][127] = reg2hw.ie03.e31.q;
+  assign ie[0][128] = reg2hw.ie04.e0.q;
+  assign ie[0][129] = reg2hw.ie04.e1.q;
+  assign ie[0][130] = reg2hw.ie04.e2.q;
+  assign ie[0][131] = reg2hw.ie04.e3.q;
+  assign ie[0][132] = reg2hw.ie04.e4.q;
+  assign ie[0][133] = reg2hw.ie04.e5.q;
+  assign ie[0][134] = reg2hw.ie04.e6.q;
+  assign ie[0][135] = reg2hw.ie04.e7.q;
+  assign ie[0][136] = reg2hw.ie04.e8.q;
+  assign ie[0][137] = reg2hw.ie04.e9.q;
+  assign ie[0][138] = reg2hw.ie04.e10.q;
+  assign ie[0][139] = reg2hw.ie04.e11.q;
+  assign ie[0][140] = reg2hw.ie04.e12.q;
+  assign ie[0][141] = reg2hw.ie04.e13.q;
+  assign ie[0][142] = reg2hw.ie04.e14.q;
+  assign ie[0][143] = reg2hw.ie04.e15.q;
+  assign ie[0][144] = reg2hw.ie04.e16.q;
+  assign ie[0][145] = reg2hw.ie04.e17.q;
+  assign ie[0][146] = reg2hw.ie04.e18.q;
+  assign ie[0][147] = reg2hw.ie04.e19.q;
+  assign ie[0][148] = reg2hw.ie04.e20.q;
+  assign ie[0][149] = reg2hw.ie04.e21.q;
+  assign ie[0][150] = reg2hw.ie04.e22.q;
+  assign ie[0][151] = reg2hw.ie04.e23.q;
+  assign ie[0][152] = reg2hw.ie04.e24.q;
+  assign ie[0][153] = reg2hw.ie04.e25.q;
+  assign ie[0][154] = reg2hw.ie04.e26.q;
+  assign ie[0][155] = reg2hw.ie04.e27.q;
+  assign ie[0][156] = reg2hw.ie04.e28.q;
+  assign ie[0][157] = reg2hw.ie04.e29.q;
+  assign ie[0][158] = reg2hw.ie04.e30.q;
+  assign ie[0][159] = reg2hw.ie04.e31.q;
+  assign ie[0][160] = reg2hw.ie05.e0.q;
+  assign ie[0][161] = reg2hw.ie05.e1.q;
+  assign ie[0][162] = reg2hw.ie05.e2.q;
+  assign ie[0][163] = reg2hw.ie05.e3.q;
+  assign ie[0][164] = reg2hw.ie05.e4.q;
+  assign ie[0][165] = reg2hw.ie05.e5.q;
+  assign ie[0][166] = reg2hw.ie05.e6.q;
+  assign ie[0][167] = reg2hw.ie05.e7.q;
+  assign ie[0][168] = reg2hw.ie05.e8.q;
+  assign ie[0][169] = reg2hw.ie05.e9.q;
+  assign ie[0][170] = reg2hw.ie05.e10.q;
+  assign ie[0][171] = reg2hw.ie05.e11.q;
+  assign ie[0][172] = reg2hw.ie05.e12.q;
+  assign ie[0][173] = reg2hw.ie05.e13.q;
+  assign ie[0][174] = reg2hw.ie05.e14.q;
+  assign ie[0][175] = reg2hw.ie05.e15.q;
+  assign ie[0][176] = reg2hw.ie05.e16.q;
+  assign ie[0][177] = reg2hw.ie05.e17.q;
+  assign ie[0][178] = reg2hw.ie05.e18.q;
+  assign ie[0][179] = reg2hw.ie05.e19.q;
+  assign ie[0][180] = reg2hw.ie05.e20.q;
+  assign ie[0][181] = reg2hw.ie05.e21.q;
+  assign ie[0][182] = reg2hw.ie05.e22.q;
+  assign ie[0][183] = reg2hw.ie05.e23.q;
+  assign ie[0][184] = reg2hw.ie05.e24.q;
+  assign ie[0][185] = reg2hw.ie05.e25.q;
+  assign ie[0][186] = reg2hw.ie05.e26.q;
+  assign ie[0][187] = reg2hw.ie05.e27.q;
+  assign ie[0][188] = reg2hw.ie05.e28.q;
+  assign ie[0][189] = reg2hw.ie05.e29.q;
+  assign ie[0][190] = reg2hw.ie05.e30.q;
+  assign ie[0][191] = reg2hw.ie05.e31.q;
+  assign ie[0][192] = reg2hw.ie06.e0.q;
+  assign ie[0][193] = reg2hw.ie06.e1.q;
+  assign ie[0][194] = reg2hw.ie06.e2.q;
+  assign ie[0][195] = reg2hw.ie06.e3.q;
+  assign ie[0][196] = reg2hw.ie06.e4.q;
+  assign ie[0][197] = reg2hw.ie06.e5.q;
+  assign ie[0][198] = reg2hw.ie06.e6.q;
+  assign ie[0][199] = reg2hw.ie06.e7.q;
+  assign ie[0][200] = reg2hw.ie06.e8.q;
+  assign ie[0][201] = reg2hw.ie06.e9.q;
+  assign ie[0][202] = reg2hw.ie06.e10.q;
+  assign ie[0][203] = reg2hw.ie06.e11.q;
+  assign ie[0][204] = reg2hw.ie06.e12.q;
+  assign ie[0][205] = reg2hw.ie06.e13.q;
+  assign ie[0][206] = reg2hw.ie06.e14.q;
+  assign ie[0][207] = reg2hw.ie06.e15.q;
+  assign ie[0][208] = reg2hw.ie06.e16.q;
+  assign ie[0][209] = reg2hw.ie06.e17.q;
+  assign ie[0][210] = reg2hw.ie06.e18.q;
+  assign ie[0][211] = reg2hw.ie06.e19.q;
+  assign ie[0][212] = reg2hw.ie06.e20.q;
+  assign ie[0][213] = reg2hw.ie06.e21.q;
+  assign ie[0][214] = reg2hw.ie06.e22.q;
+  assign ie[0][215] = reg2hw.ie06.e23.q;
+  assign ie[0][216] = reg2hw.ie06.e24.q;
+  assign ie[0][217] = reg2hw.ie06.e25.q;
+  assign ie[0][218] = reg2hw.ie06.e26.q;
+  assign ie[0][219] = reg2hw.ie06.e27.q;
+  assign ie[0][220] = reg2hw.ie06.e28.q;
+  assign ie[0][221] = reg2hw.ie06.e29.q;
+  assign ie[0][222] = reg2hw.ie06.e30.q;
+  assign ie[0][223] = reg2hw.ie06.e31.q;
+  assign ie[0][224] = reg2hw.ie07.e0.q;
+  assign ie[0][225] = reg2hw.ie07.e1.q;
+  assign ie[0][226] = reg2hw.ie07.e2.q;
+  assign ie[0][227] = reg2hw.ie07.e3.q;
+  assign ie[0][228] = reg2hw.ie07.e4.q;
+  assign ie[0][229] = reg2hw.ie07.e5.q;
+  assign ie[0][230] = reg2hw.ie07.e6.q;
+  assign ie[0][231] = reg2hw.ie07.e7.q;
+  assign ie[0][232] = reg2hw.ie07.e8.q;
+  assign ie[0][233] = reg2hw.ie07.e9.q;
+  assign ie[0][234] = reg2hw.ie07.e10.q;
+  assign ie[0][235] = reg2hw.ie07.e11.q;
+  assign ie[0][236] = reg2hw.ie07.e12.q;
+  assign ie[0][237] = reg2hw.ie07.e13.q;
+  assign ie[0][238] = reg2hw.ie07.e14.q;
+  assign ie[0][239] = reg2hw.ie07.e15.q;
+  assign ie[0][240] = reg2hw.ie07.e16.q;
+  assign ie[0][241] = reg2hw.ie07.e17.q;
+  assign ie[0][242] = reg2hw.ie07.e18.q;
+  assign ie[0][243] = reg2hw.ie07.e19.q;
+  assign ie[0][244] = reg2hw.ie07.e20.q;
+  assign ie[0][245] = reg2hw.ie07.e21.q;
+  assign ie[0][246] = reg2hw.ie07.e22.q;
+  assign ie[0][247] = reg2hw.ie07.e23.q;
+  assign ie[0][248] = reg2hw.ie07.e24.q;
+  assign ie[0][249] = reg2hw.ie07.e25.q;
+  assign ie[0][250] = reg2hw.ie07.e26.q;
+  assign ie[0][251] = reg2hw.ie07.e27.q;
+  assign ie[0][252] = reg2hw.ie07.e28.q;
+  assign ie[0][253] = reg2hw.ie07.e29.q;
+  assign ie[0][254] = reg2hw.ie07.e30.q;
+  assign ie[0][255] = reg2hw.ie07.e31.q;
+  assign ie[1][0] = reg2hw.ie1.e0.q;
+  assign ie[1][1] = reg2hw.ie1.e1.q;
+  assign ie[1][2] = reg2hw.ie1.e2.q;
+  assign ie[1][3] = reg2hw.ie1.e3.q;
+  assign ie[1][4] = reg2hw.ie1.e4.q;
+  assign ie[1][5] = reg2hw.ie1.e5.q;
+  assign ie[1][6] = reg2hw.ie1.e6.q;
+  assign ie[1][7] = reg2hw.ie1.e7.q;
+  assign ie[1][8] = reg2hw.ie1.e8.q;
+  assign ie[1][9] = reg2hw.ie1.e9.q;
+  assign ie[1][10] = reg2hw.ie1.e10.q;
+  assign ie[1][11] = reg2hw.ie1.e11.q;
+  assign ie[1][12] = reg2hw.ie1.e12.q;
+  assign ie[1][13] = reg2hw.ie1.e13.q;
+  assign ie[1][14] = reg2hw.ie1.e14.q;
+  assign ie[1][15] = reg2hw.ie1.e15.q;
+  assign ie[1][16] = reg2hw.ie1.e16.q;
+  assign ie[1][17] = reg2hw.ie1.e17.q;
+  assign ie[1][18] = reg2hw.ie1.e18.q;
+  assign ie[1][19] = reg2hw.ie1.e19.q;
+  assign ie[1][20] = reg2hw.ie1.e20.q;
+  assign ie[1][21] = reg2hw.ie1.e21.q;
+  assign ie[1][22] = reg2hw.ie1.e22.q;
+  assign ie[1][23] = reg2hw.ie1.e23.q;
+  assign ie[1][24] = reg2hw.ie1.e24.q;
+  assign ie[1][25] = reg2hw.ie1.e25.q;
+  assign ie[1][26] = reg2hw.ie1.e26.q;
+  assign ie[1][27] = reg2hw.ie1.e27.q;
+  assign ie[1][28] = reg2hw.ie1.e28.q;
+  assign ie[1][29] = reg2hw.ie1.e29.q;
+  assign ie[1][30] = reg2hw.ie1.e30.q;
+  assign ie[1][31] = reg2hw.ie1.e31.q;
+  assign ie[1][32] = reg2hw.ie1.e32.q;
+  assign ie[1][33] = reg2hw.ie11.e1.q;
+  assign ie[1][34] = reg2hw.ie11.e2.q;
+  assign ie[1][35] = reg2hw.ie11.e3.q;
+  assign ie[1][36] = reg2hw.ie11.e4.q;
+  assign ie[1][37] = reg2hw.ie11.e5.q;
+  assign ie[1][38] = reg2hw.ie11.e6.q;
+  assign ie[1][39] = reg2hw.ie11.e7.q;
+  assign ie[1][40] = reg2hw.ie11.e8.q;
+  assign ie[1][41] = reg2hw.ie11.e9.q;
+  assign ie[1][42] = reg2hw.ie11.e10.q;
+  assign ie[1][43] = reg2hw.ie11.e11.q;
+  assign ie[1][44] = reg2hw.ie11.e12.q;
+  assign ie[1][45] = reg2hw.ie11.e13.q;
+  assign ie[1][46] = reg2hw.ie11.e14.q;
+  assign ie[1][47] = reg2hw.ie11.e15.q;
+  assign ie[1][48] = reg2hw.ie11.e16.q;
+  assign ie[1][49] = reg2hw.ie11.e17.q;
+  assign ie[1][50] = reg2hw.ie11.e18.q;
+  assign ie[1][51] = reg2hw.ie11.e19.q;
+  assign ie[1][52] = reg2hw.ie11.e20.q;
+  assign ie[1][53] = reg2hw.ie11.e21.q;
+  assign ie[1][54] = reg2hw.ie11.e22.q;
+  assign ie[1][55] = reg2hw.ie11.e23.q;
+  assign ie[1][56] = reg2hw.ie11.e24.q;
+  assign ie[1][57] = reg2hw.ie11.e25.q;
+  assign ie[1][58] = reg2hw.ie11.e26.q;
+  assign ie[1][59] = reg2hw.ie11.e27.q;
+  assign ie[1][60] = reg2hw.ie11.e28.q;
+  assign ie[1][61] = reg2hw.ie11.e29.q;
+  assign ie[1][62] = reg2hw.ie11.e30.q;
+  assign ie[1][63] = reg2hw.ie11.e31.q;
+  assign ie[1][64] = reg2hw.ie12.e0.q;
+  assign ie[1][65] = reg2hw.ie12.e1.q;
+  assign ie[1][66] = reg2hw.ie12.e2.q;
+  assign ie[1][67] = reg2hw.ie12.e3.q;
+  assign ie[1][68] = reg2hw.ie12.e4.q;
+  assign ie[1][69] = reg2hw.ie12.e5.q;
+  assign ie[1][70] = reg2hw.ie12.e6.q;
+  assign ie[1][71] = reg2hw.ie12.e7.q;
+  assign ie[1][72] = reg2hw.ie12.e8.q;
+  assign ie[1][73] = reg2hw.ie12.e9.q;
+  assign ie[1][74] = reg2hw.ie12.e10.q;
+  assign ie[1][75] = reg2hw.ie12.e11.q;
+  assign ie[1][76] = reg2hw.ie12.e12.q;
+  assign ie[1][77] = reg2hw.ie12.e13.q;
+  assign ie[1][78] = reg2hw.ie12.e14.q;
+  assign ie[1][79] = reg2hw.ie12.e15.q;
+  assign ie[1][80] = reg2hw.ie12.e16.q;
+  assign ie[1][81] = reg2hw.ie12.e17.q;
+  assign ie[1][82] = reg2hw.ie12.e18.q;
+  assign ie[1][83] = reg2hw.ie12.e19.q;
+  assign ie[1][84] = reg2hw.ie12.e20.q;
+  assign ie[1][85] = reg2hw.ie12.e21.q;
+  assign ie[1][86] = reg2hw.ie12.e22.q;
+  assign ie[1][87] = reg2hw.ie12.e23.q;
+  assign ie[1][88] = reg2hw.ie12.e24.q;
+  assign ie[1][89] = reg2hw.ie12.e25.q;
+  assign ie[1][90] = reg2hw.ie12.e26.q;
+  assign ie[1][91] = reg2hw.ie12.e27.q;
+  assign ie[1][92] = reg2hw.ie12.e28.q;
+  assign ie[1][93] = reg2hw.ie12.e29.q;
+  assign ie[1][94] = reg2hw.ie12.e30.q;
+  assign ie[1][95] = reg2hw.ie12.e31.q;
+  assign ie[1][96] = reg2hw.ie13.e0.q;
+  assign ie[1][97] = reg2hw.ie13.e1.q;
+  assign ie[1][98] = reg2hw.ie13.e2.q;
+  assign ie[1][99] = reg2hw.ie13.e3.q;
+  assign ie[1][100] = reg2hw.ie13.e4.q;
+  assign ie[1][101] = reg2hw.ie13.e5.q;
+  assign ie[1][102] = reg2hw.ie13.e6.q;
+  assign ie[1][103] = reg2hw.ie13.e7.q;
+  assign ie[1][104] = reg2hw.ie13.e8.q;
+  assign ie[1][105] = reg2hw.ie13.e9.q;
+  assign ie[1][106] = reg2hw.ie13.e10.q;
+  assign ie[1][107] = reg2hw.ie13.e11.q;
+  assign ie[1][108] = reg2hw.ie13.e12.q;
+  assign ie[1][109] = reg2hw.ie13.e13.q;
+  assign ie[1][110] = reg2hw.ie13.e14.q;
+  assign ie[1][111] = reg2hw.ie13.e15.q;
+  assign ie[1][112] = reg2hw.ie13.e16.q;
+  assign ie[1][113] = reg2hw.ie13.e17.q;
+  assign ie[1][114] = reg2hw.ie13.e18.q;
+  assign ie[1][115] = reg2hw.ie13.e19.q;
+  assign ie[1][116] = reg2hw.ie13.e20.q;
+  assign ie[1][117] = reg2hw.ie13.e21.q;
+  assign ie[1][118] = reg2hw.ie13.e22.q;
+  assign ie[1][119] = reg2hw.ie13.e23.q;
+  assign ie[1][120] = reg2hw.ie13.e24.q;
+  assign ie[1][121] = reg2hw.ie13.e25.q;
+  assign ie[1][122] = reg2hw.ie13.e26.q;
+  assign ie[1][123] = reg2hw.ie13.e27.q;
+  assign ie[1][124] = reg2hw.ie13.e28.q;
+  assign ie[1][125] = reg2hw.ie13.e29.q;
+  assign ie[1][126] = reg2hw.ie13.e30.q;
+  assign ie[1][127] = reg2hw.ie13.e31.q;
+  assign ie[1][128] = reg2hw.ie14.e0.q;
+  assign ie[1][129] = reg2hw.ie14.e1.q;
+  assign ie[1][130] = reg2hw.ie14.e2.q;
+  assign ie[1][131] = reg2hw.ie14.e3.q;
+  assign ie[1][132] = reg2hw.ie14.e4.q;
+  assign ie[1][133] = reg2hw.ie14.e5.q;
+  assign ie[1][134] = reg2hw.ie14.e6.q;
+  assign ie[1][135] = reg2hw.ie14.e7.q;
+  assign ie[1][136] = reg2hw.ie14.e8.q;
+  assign ie[1][137] = reg2hw.ie14.e9.q;
+  assign ie[1][138] = reg2hw.ie14.e10.q;
+  assign ie[1][139] = reg2hw.ie14.e11.q;
+  assign ie[1][140] = reg2hw.ie14.e12.q;
+  assign ie[1][141] = reg2hw.ie14.e13.q;
+  assign ie[1][142] = reg2hw.ie14.e14.q;
+  assign ie[1][143] = reg2hw.ie14.e15.q;
+  assign ie[1][144] = reg2hw.ie14.e16.q;
+  assign ie[1][145] = reg2hw.ie14.e17.q;
+  assign ie[1][146] = reg2hw.ie14.e18.q;
+  assign ie[1][147] = reg2hw.ie14.e19.q;
+  assign ie[1][148] = reg2hw.ie14.e20.q;
+  assign ie[1][149] = reg2hw.ie14.e21.q;
+  assign ie[1][150] = reg2hw.ie14.e22.q;
+  assign ie[1][151] = reg2hw.ie14.e23.q;
+  assign ie[1][152] = reg2hw.ie14.e24.q;
+  assign ie[1][153] = reg2hw.ie14.e25.q;
+  assign ie[1][154] = reg2hw.ie14.e26.q;
+  assign ie[1][155] = reg2hw.ie14.e27.q;
+  assign ie[1][156] = reg2hw.ie14.e28.q;
+  assign ie[1][157] = reg2hw.ie14.e29.q;
+  assign ie[1][158] = reg2hw.ie14.e30.q;
+  assign ie[1][159] = reg2hw.ie14.e31.q;
+  assign ie[1][160] = reg2hw.ie15.e0.q;
+  assign ie[1][161] = reg2hw.ie15.e1.q;
+  assign ie[1][162] = reg2hw.ie15.e2.q;
+  assign ie[1][163] = reg2hw.ie15.e3.q;
+  assign ie[1][164] = reg2hw.ie15.e4.q;
+  assign ie[1][165] = reg2hw.ie15.e5.q;
+  assign ie[1][166] = reg2hw.ie15.e6.q;
+  assign ie[1][167] = reg2hw.ie15.e7.q;
+  assign ie[1][168] = reg2hw.ie15.e8.q;
+  assign ie[1][169] = reg2hw.ie15.e9.q;
+  assign ie[1][170] = reg2hw.ie15.e10.q;
+  assign ie[1][171] = reg2hw.ie15.e11.q;
+  assign ie[1][172] = reg2hw.ie15.e12.q;
+  assign ie[1][173] = reg2hw.ie15.e13.q;
+  assign ie[1][174] = reg2hw.ie15.e14.q;
+  assign ie[1][175] = reg2hw.ie15.e15.q;
+  assign ie[1][176] = reg2hw.ie15.e16.q;
+  assign ie[1][177] = reg2hw.ie15.e17.q;
+  assign ie[1][178] = reg2hw.ie15.e18.q;
+  assign ie[1][179] = reg2hw.ie15.e19.q;
+  assign ie[1][180] = reg2hw.ie15.e20.q;
+  assign ie[1][181] = reg2hw.ie15.e21.q;
+  assign ie[1][182] = reg2hw.ie15.e22.q;
+  assign ie[1][183] = reg2hw.ie15.e23.q;
+  assign ie[1][184] = reg2hw.ie15.e24.q;
+  assign ie[1][185] = reg2hw.ie15.e25.q;
+  assign ie[1][186] = reg2hw.ie15.e26.q;
+  assign ie[1][187] = reg2hw.ie15.e27.q;
+  assign ie[1][188] = reg2hw.ie15.e28.q;
+  assign ie[1][189] = reg2hw.ie15.e29.q;
+  assign ie[1][190] = reg2hw.ie15.e30.q;
+  assign ie[1][191] = reg2hw.ie15.e31.q;
+  assign ie[1][192] = reg2hw.ie16.e0.q;
+  assign ie[1][193] = reg2hw.ie16.e1.q;
+  assign ie[1][194] = reg2hw.ie16.e2.q;
+  assign ie[1][195] = reg2hw.ie16.e3.q;
+  assign ie[1][196] = reg2hw.ie16.e4.q;
+  assign ie[1][197] = reg2hw.ie16.e5.q;
+  assign ie[1][198] = reg2hw.ie16.e6.q;
+  assign ie[1][199] = reg2hw.ie16.e7.q;
+  assign ie[1][200] = reg2hw.ie16.e8.q;
+  assign ie[1][201] = reg2hw.ie16.e9.q;
+  assign ie[1][202] = reg2hw.ie16.e10.q;
+  assign ie[1][203] = reg2hw.ie16.e11.q;
+  assign ie[1][204] = reg2hw.ie16.e12.q;
+  assign ie[1][205] = reg2hw.ie16.e13.q;
+  assign ie[1][206] = reg2hw.ie16.e14.q;
+  assign ie[1][207] = reg2hw.ie16.e15.q;
+  assign ie[1][208] = reg2hw.ie16.e16.q;
+  assign ie[1][209] = reg2hw.ie16.e17.q;
+  assign ie[1][210] = reg2hw.ie16.e18.q;
+  assign ie[1][211] = reg2hw.ie16.e19.q;
+  assign ie[1][212] = reg2hw.ie16.e20.q;
+  assign ie[1][213] = reg2hw.ie16.e21.q;
+  assign ie[1][214] = reg2hw.ie16.e22.q;
+  assign ie[1][215] = reg2hw.ie16.e23.q;
+  assign ie[1][216] = reg2hw.ie16.e24.q;
+  assign ie[1][217] = reg2hw.ie16.e25.q;
+  assign ie[1][218] = reg2hw.ie16.e26.q;
+  assign ie[1][219] = reg2hw.ie16.e27.q;
+  assign ie[1][220] = reg2hw.ie16.e28.q;
+  assign ie[1][221] = reg2hw.ie16.e29.q;
+  assign ie[1][222] = reg2hw.ie16.e30.q;
+  assign ie[1][223] = reg2hw.ie16.e31.q;
+  assign ie[1][224] = reg2hw.ie17.e0.q;
+  assign ie[1][225] = reg2hw.ie17.e1.q;
+  assign ie[1][226] = reg2hw.ie17.e2.q;
+  assign ie[1][227] = reg2hw.ie17.e3.q;
+  assign ie[1][228] = reg2hw.ie17.e4.q;
+  assign ie[1][229] = reg2hw.ie17.e5.q;
+  assign ie[1][230] = reg2hw.ie17.e6.q;
+  assign ie[1][231] = reg2hw.ie17.e7.q;
+  assign ie[1][232] = reg2hw.ie17.e8.q;
+  assign ie[1][233] = reg2hw.ie17.e9.q;
+  assign ie[1][234] = reg2hw.ie17.e10.q;
+  assign ie[1][235] = reg2hw.ie17.e11.q;
+  assign ie[1][236] = reg2hw.ie17.e12.q;
+  assign ie[1][237] = reg2hw.ie17.e13.q;
+  assign ie[1][238] = reg2hw.ie17.e14.q;
+  assign ie[1][239] = reg2hw.ie17.e15.q;
+  assign ie[1][240] = reg2hw.ie17.e16.q;
+  assign ie[1][241] = reg2hw.ie17.e17.q;
+  assign ie[1][242] = reg2hw.ie17.e18.q;
+  assign ie[1][243] = reg2hw.ie17.e19.q;
+  assign ie[1][244] = reg2hw.ie17.e20.q;
+  assign ie[1][245] = reg2hw.ie17.e21.q;
+  assign ie[1][246] = reg2hw.ie17.e22.q;
+  assign ie[1][247] = reg2hw.ie17.e23.q;
+  assign ie[1][248] = reg2hw.ie17.e24.q;
+  assign ie[1][249] = reg2hw.ie17.e25.q;
+  assign ie[1][250] = reg2hw.ie17.e26.q;
+  assign ie[1][251] = reg2hw.ie17.e27.q;
+  assign ie[1][252] = reg2hw.ie17.e28.q;
+  assign ie[1][253] = reg2hw.ie17.e29.q;
+  assign ie[1][254] = reg2hw.ie17.e30.q;
+  assign ie[1][255] = reg2hw.ie17.e31.q;
+  //----------------------------------------------------------------------------
 
-////////////////////////////////////////////////////////////////////////////////
-// Interrupt Enable : Need to connect manually
-assign ie[0][ 0] = reg2hw.ie0.e0.q;
-assign ie[0][ 1] = reg2hw.ie0.e1.q;
-assign ie[0][ 2] = reg2hw.ie0.e2.q;
-assign ie[0][ 3] = reg2hw.ie0.e3.q;
-assign ie[0][ 4] = reg2hw.ie0.e4.q;
-assign ie[0][ 5] = reg2hw.ie0.e5.q;
-assign ie[0][ 6] = reg2hw.ie0.e6.q;
-assign ie[0][ 7] = reg2hw.ie0.e7.q;
-assign ie[0][ 8] = reg2hw.ie0.e8.q;
-assign ie[0][ 9] = reg2hw.ie0.e9.q;
-assign ie[0][10] = reg2hw.ie0.e10.q;
-assign ie[0][11] = reg2hw.ie0.e11.q;
-assign ie[0][12] = reg2hw.ie0.e12.q;
-assign ie[0][13] = reg2hw.ie0.e13.q;
-assign ie[0][14] = reg2hw.ie0.e14.q;
-assign ie[0][15] = reg2hw.ie0.e15.q;
-assign ie[0][16] = reg2hw.ie0.e16.q;
-assign ie[0][17] = reg2hw.ie0.e17.q;
-assign ie[0][18] = reg2hw.ie0.e18.q;
-assign ie[0][19] = reg2hw.ie0.e19.q;
-assign ie[0][20] = reg2hw.ie0.e20.q;
-assign ie[0][21] = reg2hw.ie0.e21.q;
-assign ie[0][22] = reg2hw.ie0.e22.q;
-assign ie[0][23] = reg2hw.ie0.e23.q;
-assign ie[0][24] = reg2hw.ie0.e24.q;
-assign ie[0][25] = reg2hw.ie0.e25.q;
-assign ie[0][26] = reg2hw.ie0.e26.q;
-assign ie[0][27] = reg2hw.ie0.e27.q;
-assign ie[0][28] = reg2hw.ie0.e28.q;
-assign ie[0][29] = reg2hw.ie0.e29.q;
-assign ie[0][30] = reg2hw.ie0.e30.q;
-assign ie[0][31] = reg2hw.ie0.e31.q;
-//------------------------------------------------------------------------------
+  //////////////////////////////////////////////////////////////////////////////
+  // THRESHOLD register
+  assign threshold[0] = reg2hw.threshold0.q;
+  assign threshold[1] = reg2hw.threshold1.q;
+  //----------------------------------------------------------------------------
 
-////////////////////////////////////////////////////////////////////////////////
-// THRESHOLD : Need to connect manually
-assign threshold[0] = reg2hw.threshold0.q;
-//------------------------------------------------------------------------------
+  //////////////////////////////////////////////////////////////////////////////
+  // CC register
+  assign claim_re[0]    = reg2hw.cc0.re;
+  assign claim_id[0]    = irq_id_o[0];
+  assign complete_we[0] = reg2hw.cc0.qe;
+  assign complete_id[0] = reg2hw.cc0.q;
+  assign hw2reg.cc0.d   = cc_id[0];
+  assign claim_re[1]    = reg2hw.cc1.re;
+  assign claim_id[1]    = irq_id_o[1];
+  assign complete_we[1] = reg2hw.cc1.qe;
+  assign complete_id[1] = reg2hw.cc1.q;
+  assign hw2reg.cc1.d   = cc_id[1];
+  //----------------------------------------------------------------------------
 
-////////////////////////////////////////////////////////////////////////////////
-// CC : Need to connect manually
-assign claim_re[0] = reg2hw.cc0.re;
-assign claim_id[0] = irq_id_o[0];
-assign complete_we[0] = reg2hw.cc0.qe;
-assign complete_id[0] = reg2hw.cc0.q;
+  //////////////////////////////////////////////////////////////////////////////
+  // IP
+  assign hw2reg.ip.p0.de = 1'b1; // Always write
+  assign hw2reg.ip.p1.de = 1'b1; // Always write
+  assign hw2reg.ip.p2.de = 1'b1; // Always write
+  assign hw2reg.ip.p3.de = 1'b1; // Always write
+  assign hw2reg.ip.p4.de = 1'b1; // Always write
+  assign hw2reg.ip.p5.de = 1'b1; // Always write
+  assign hw2reg.ip.p6.de = 1'b1; // Always write
+  assign hw2reg.ip.p7.de = 1'b1; // Always write
+  assign hw2reg.ip.p8.de = 1'b1; // Always write
+  assign hw2reg.ip.p9.de = 1'b1; // Always write
+  assign hw2reg.ip.p10.de = 1'b1; // Always write
+  assign hw2reg.ip.p11.de = 1'b1; // Always write
+  assign hw2reg.ip.p12.de = 1'b1; // Always write
+  assign hw2reg.ip.p13.de = 1'b1; // Always write
+  assign hw2reg.ip.p14.de = 1'b1; // Always write
+  assign hw2reg.ip.p15.de = 1'b1; // Always write
+  assign hw2reg.ip.p16.de = 1'b1; // Always write
+  assign hw2reg.ip.p17.de = 1'b1; // Always write
+  assign hw2reg.ip.p18.de = 1'b1; // Always write
+  assign hw2reg.ip.p19.de = 1'b1; // Always write
+  assign hw2reg.ip.p20.de = 1'b1; // Always write
+  assign hw2reg.ip.p21.de = 1'b1; // Always write
+  assign hw2reg.ip.p22.de = 1'b1; // Always write
+  assign hw2reg.ip.p23.de = 1'b1; // Always write
+  assign hw2reg.ip.p24.de = 1'b1; // Always write
+  assign hw2reg.ip.p25.de = 1'b1; // Always write
+  assign hw2reg.ip.p26.de = 1'b1; // Always write
+  assign hw2reg.ip.p27.de = 1'b1; // Always write
+  assign hw2reg.ip.p28.de = 1'b1; // Always write
+  assign hw2reg.ip.p29.de = 1'b1; // Always write
+  assign hw2reg.ip.p30.de = 1'b1; // Always write
+  assign hw2reg.ip.p31.de = 1'b1; // Always write
+  assign hw2reg.ip.p32.de = 1'b1; // Always write
+  assign hw2reg.ip1.p1.de = 1'b1; // Always write
+  assign hw2reg.ip1.p2.de = 1'b1; // Always write
+  assign hw2reg.ip1.p3.de = 1'b1; // Always write
+  assign hw2reg.ip1.p4.de = 1'b1; // Always write
+  assign hw2reg.ip1.p5.de = 1'b1; // Always write
+  assign hw2reg.ip1.p6.de = 1'b1; // Always write
+  assign hw2reg.ip1.p7.de = 1'b1; // Always write
+  assign hw2reg.ip1.p8.de = 1'b1; // Always write
+  assign hw2reg.ip1.p9.de = 1'b1; // Always write
+  assign hw2reg.ip1.p10.de = 1'b1; // Always write
+  assign hw2reg.ip1.p11.de = 1'b1; // Always write
+  assign hw2reg.ip1.p12.de = 1'b1; // Always write
+  assign hw2reg.ip1.p13.de = 1'b1; // Always write
+  assign hw2reg.ip1.p14.de = 1'b1; // Always write
+  assign hw2reg.ip1.p15.de = 1'b1; // Always write
+  assign hw2reg.ip1.p16.de = 1'b1; // Always write
+  assign hw2reg.ip1.p17.de = 1'b1; // Always write
+  assign hw2reg.ip1.p18.de = 1'b1; // Always write
+  assign hw2reg.ip1.p19.de = 1'b1; // Always write
+  assign hw2reg.ip1.p20.de = 1'b1; // Always write
+  assign hw2reg.ip1.p21.de = 1'b1; // Always write
+  assign hw2reg.ip1.p22.de = 1'b1; // Always write
+  assign hw2reg.ip1.p23.de = 1'b1; // Always write
+  assign hw2reg.ip1.p24.de = 1'b1; // Always write
+  assign hw2reg.ip1.p25.de = 1'b1; // Always write
+  assign hw2reg.ip1.p26.de = 1'b1; // Always write
+  assign hw2reg.ip1.p27.de = 1'b1; // Always write
+  assign hw2reg.ip1.p28.de = 1'b1; // Always write
+  assign hw2reg.ip1.p29.de = 1'b1; // Always write
+  assign hw2reg.ip1.p30.de = 1'b1; // Always write
+  assign hw2reg.ip1.p31.de = 1'b1; // Always write
+  assign hw2reg.ip2.p0.de = 1'b1; // Always write
+  assign hw2reg.ip2.p1.de = 1'b1; // Always write
+  assign hw2reg.ip2.p2.de = 1'b1; // Always write
+  assign hw2reg.ip2.p3.de = 1'b1; // Always write
+  assign hw2reg.ip2.p4.de = 1'b1; // Always write
+  assign hw2reg.ip2.p5.de = 1'b1; // Always write
+  assign hw2reg.ip2.p6.de = 1'b1; // Always write
+  assign hw2reg.ip2.p7.de = 1'b1; // Always write
+  assign hw2reg.ip2.p8.de = 1'b1; // Always write
+  assign hw2reg.ip2.p9.de = 1'b1; // Always write
+  assign hw2reg.ip2.p10.de = 1'b1; // Always write
+  assign hw2reg.ip2.p11.de = 1'b1; // Always write
+  assign hw2reg.ip2.p12.de = 1'b1; // Always write
+  assign hw2reg.ip2.p13.de = 1'b1; // Always write
+  assign hw2reg.ip2.p14.de = 1'b1; // Always write
+  assign hw2reg.ip2.p15.de = 1'b1; // Always write
+  assign hw2reg.ip2.p16.de = 1'b1; // Always write
+  assign hw2reg.ip2.p17.de = 1'b1; // Always write
+  assign hw2reg.ip2.p18.de = 1'b1; // Always write
+  assign hw2reg.ip2.p19.de = 1'b1; // Always write
+  assign hw2reg.ip2.p20.de = 1'b1; // Always write
+  assign hw2reg.ip2.p21.de = 1'b1; // Always write
+  assign hw2reg.ip2.p22.de = 1'b1; // Always write
+  assign hw2reg.ip2.p23.de = 1'b1; // Always write
+  assign hw2reg.ip2.p24.de = 1'b1; // Always write
+  assign hw2reg.ip2.p25.de = 1'b1; // Always write
+  assign hw2reg.ip2.p26.de = 1'b1; // Always write
+  assign hw2reg.ip2.p27.de = 1'b1; // Always write
+  assign hw2reg.ip2.p28.de = 1'b1; // Always write
+  assign hw2reg.ip2.p29.de = 1'b1; // Always write
+  assign hw2reg.ip2.p30.de = 1'b1; // Always write
+  assign hw2reg.ip2.p31.de = 1'b1; // Always write
+  assign hw2reg.ip3.p0.de = 1'b1; // Always write
+  assign hw2reg.ip3.p1.de = 1'b1; // Always write
+  assign hw2reg.ip3.p2.de = 1'b1; // Always write
+  assign hw2reg.ip3.p3.de = 1'b1; // Always write
+  assign hw2reg.ip3.p4.de = 1'b1; // Always write
+  assign hw2reg.ip3.p5.de = 1'b1; // Always write
+  assign hw2reg.ip3.p6.de = 1'b1; // Always write
+  assign hw2reg.ip3.p7.de = 1'b1; // Always write
+  assign hw2reg.ip3.p8.de = 1'b1; // Always write
+  assign hw2reg.ip3.p9.de = 1'b1; // Always write
+  assign hw2reg.ip3.p10.de = 1'b1; // Always write
+  assign hw2reg.ip3.p11.de = 1'b1; // Always write
+  assign hw2reg.ip3.p12.de = 1'b1; // Always write
+  assign hw2reg.ip3.p13.de = 1'b1; // Always write
+  assign hw2reg.ip3.p14.de = 1'b1; // Always write
+  assign hw2reg.ip3.p15.de = 1'b1; // Always write
+  assign hw2reg.ip3.p16.de = 1'b1; // Always write
+  assign hw2reg.ip3.p17.de = 1'b1; // Always write
+  assign hw2reg.ip3.p18.de = 1'b1; // Always write
+  assign hw2reg.ip3.p19.de = 1'b1; // Always write
+  assign hw2reg.ip3.p20.de = 1'b1; // Always write
+  assign hw2reg.ip3.p21.de = 1'b1; // Always write
+  assign hw2reg.ip3.p22.de = 1'b1; // Always write
+  assign hw2reg.ip3.p23.de = 1'b1; // Always write
+  assign hw2reg.ip3.p24.de = 1'b1; // Always write
+  assign hw2reg.ip3.p25.de = 1'b1; // Always write
+  assign hw2reg.ip3.p26.de = 1'b1; // Always write
+  assign hw2reg.ip3.p27.de = 1'b1; // Always write
+  assign hw2reg.ip3.p28.de = 1'b1; // Always write
+  assign hw2reg.ip3.p29.de = 1'b1; // Always write
+  assign hw2reg.ip3.p30.de = 1'b1; // Always write
+  assign hw2reg.ip3.p31.de = 1'b1; // Always write
+  assign hw2reg.ip4.p0.de = 1'b1; // Always write
+  assign hw2reg.ip4.p1.de = 1'b1; // Always write
+  assign hw2reg.ip4.p2.de = 1'b1; // Always write
+  assign hw2reg.ip4.p3.de = 1'b1; // Always write
+  assign hw2reg.ip4.p4.de = 1'b1; // Always write
+  assign hw2reg.ip4.p5.de = 1'b1; // Always write
+  assign hw2reg.ip4.p6.de = 1'b1; // Always write
+  assign hw2reg.ip4.p7.de = 1'b1; // Always write
+  assign hw2reg.ip4.p8.de = 1'b1; // Always write
+  assign hw2reg.ip4.p9.de = 1'b1; // Always write
+  assign hw2reg.ip4.p10.de = 1'b1; // Always write
+  assign hw2reg.ip4.p11.de = 1'b1; // Always write
+  assign hw2reg.ip4.p12.de = 1'b1; // Always write
+  assign hw2reg.ip4.p13.de = 1'b1; // Always write
+  assign hw2reg.ip4.p14.de = 1'b1; // Always write
+  assign hw2reg.ip4.p15.de = 1'b1; // Always write
+  assign hw2reg.ip4.p16.de = 1'b1; // Always write
+  assign hw2reg.ip4.p17.de = 1'b1; // Always write
+  assign hw2reg.ip4.p18.de = 1'b1; // Always write
+  assign hw2reg.ip4.p19.de = 1'b1; // Always write
+  assign hw2reg.ip4.p20.de = 1'b1; // Always write
+  assign hw2reg.ip4.p21.de = 1'b1; // Always write
+  assign hw2reg.ip4.p22.de = 1'b1; // Always write
+  assign hw2reg.ip4.p23.de = 1'b1; // Always write
+  assign hw2reg.ip4.p24.de = 1'b1; // Always write
+  assign hw2reg.ip4.p25.de = 1'b1; // Always write
+  assign hw2reg.ip4.p26.de = 1'b1; // Always write
+  assign hw2reg.ip4.p27.de = 1'b1; // Always write
+  assign hw2reg.ip4.p28.de = 1'b1; // Always write
+  assign hw2reg.ip4.p29.de = 1'b1; // Always write
+  assign hw2reg.ip4.p30.de = 1'b1; // Always write
+  assign hw2reg.ip4.p31.de = 1'b1; // Always write
+  assign hw2reg.ip5.p0.de = 1'b1; // Always write
+  assign hw2reg.ip5.p1.de = 1'b1; // Always write
+  assign hw2reg.ip5.p2.de = 1'b1; // Always write
+  assign hw2reg.ip5.p3.de = 1'b1; // Always write
+  assign hw2reg.ip5.p4.de = 1'b1; // Always write
+  assign hw2reg.ip5.p5.de = 1'b1; // Always write
+  assign hw2reg.ip5.p6.de = 1'b1; // Always write
+  assign hw2reg.ip5.p7.de = 1'b1; // Always write
+  assign hw2reg.ip5.p8.de = 1'b1; // Always write
+  assign hw2reg.ip5.p9.de = 1'b1; // Always write
+  assign hw2reg.ip5.p10.de = 1'b1; // Always write
+  assign hw2reg.ip5.p11.de = 1'b1; // Always write
+  assign hw2reg.ip5.p12.de = 1'b1; // Always write
+  assign hw2reg.ip5.p13.de = 1'b1; // Always write
+  assign hw2reg.ip5.p14.de = 1'b1; // Always write
+  assign hw2reg.ip5.p15.de = 1'b1; // Always write
+  assign hw2reg.ip5.p16.de = 1'b1; // Always write
+  assign hw2reg.ip5.p17.de = 1'b1; // Always write
+  assign hw2reg.ip5.p18.de = 1'b1; // Always write
+  assign hw2reg.ip5.p19.de = 1'b1; // Always write
+  assign hw2reg.ip5.p20.de = 1'b1; // Always write
+  assign hw2reg.ip5.p21.de = 1'b1; // Always write
+  assign hw2reg.ip5.p22.de = 1'b1; // Always write
+  assign hw2reg.ip5.p23.de = 1'b1; // Always write
+  assign hw2reg.ip5.p24.de = 1'b1; // Always write
+  assign hw2reg.ip5.p25.de = 1'b1; // Always write
+  assign hw2reg.ip5.p26.de = 1'b1; // Always write
+  assign hw2reg.ip5.p27.de = 1'b1; // Always write
+  assign hw2reg.ip5.p28.de = 1'b1; // Always write
+  assign hw2reg.ip5.p29.de = 1'b1; // Always write
+  assign hw2reg.ip5.p30.de = 1'b1; // Always write
+  assign hw2reg.ip5.p31.de = 1'b1; // Always write
+  assign hw2reg.ip6.p0.de = 1'b1; // Always write
+  assign hw2reg.ip6.p1.de = 1'b1; // Always write
+  assign hw2reg.ip6.p2.de = 1'b1; // Always write
+  assign hw2reg.ip6.p3.de = 1'b1; // Always write
+  assign hw2reg.ip6.p4.de = 1'b1; // Always write
+  assign hw2reg.ip6.p5.de = 1'b1; // Always write
+  assign hw2reg.ip6.p6.de = 1'b1; // Always write
+  assign hw2reg.ip6.p7.de = 1'b1; // Always write
+  assign hw2reg.ip6.p8.de = 1'b1; // Always write
+  assign hw2reg.ip6.p9.de = 1'b1; // Always write
+  assign hw2reg.ip6.p10.de = 1'b1; // Always write
+  assign hw2reg.ip6.p11.de = 1'b1; // Always write
+  assign hw2reg.ip6.p12.de = 1'b1; // Always write
+  assign hw2reg.ip6.p13.de = 1'b1; // Always write
+  assign hw2reg.ip6.p14.de = 1'b1; // Always write
+  assign hw2reg.ip6.p15.de = 1'b1; // Always write
+  assign hw2reg.ip6.p16.de = 1'b1; // Always write
+  assign hw2reg.ip6.p17.de = 1'b1; // Always write
+  assign hw2reg.ip6.p18.de = 1'b1; // Always write
+  assign hw2reg.ip6.p19.de = 1'b1; // Always write
+  assign hw2reg.ip6.p20.de = 1'b1; // Always write
+  assign hw2reg.ip6.p21.de = 1'b1; // Always write
+  assign hw2reg.ip6.p22.de = 1'b1; // Always write
+  assign hw2reg.ip6.p23.de = 1'b1; // Always write
+  assign hw2reg.ip6.p24.de = 1'b1; // Always write
+  assign hw2reg.ip6.p25.de = 1'b1; // Always write
+  assign hw2reg.ip6.p26.de = 1'b1; // Always write
+  assign hw2reg.ip6.p27.de = 1'b1; // Always write
+  assign hw2reg.ip6.p28.de = 1'b1; // Always write
+  assign hw2reg.ip6.p29.de = 1'b1; // Always write
+  assign hw2reg.ip6.p30.de = 1'b1; // Always write
+  assign hw2reg.ip6.p31.de = 1'b1; // Always write
+  assign hw2reg.ip7.p0.de = 1'b1; // Always write
+  assign hw2reg.ip7.p1.de = 1'b1; // Always write
+  assign hw2reg.ip7.p2.de = 1'b1; // Always write
+  assign hw2reg.ip7.p3.de = 1'b1; // Always write
+  assign hw2reg.ip7.p4.de = 1'b1; // Always write
+  assign hw2reg.ip7.p5.de = 1'b1; // Always write
+  assign hw2reg.ip7.p6.de = 1'b1; // Always write
+  assign hw2reg.ip7.p7.de = 1'b1; // Always write
+  assign hw2reg.ip7.p8.de = 1'b1; // Always write
+  assign hw2reg.ip7.p9.de = 1'b1; // Always write
+  assign hw2reg.ip7.p10.de = 1'b1; // Always write
+  assign hw2reg.ip7.p11.de = 1'b1; // Always write
+  assign hw2reg.ip7.p12.de = 1'b1; // Always write
+  assign hw2reg.ip7.p13.de = 1'b1; // Always write
+  assign hw2reg.ip7.p14.de = 1'b1; // Always write
+  assign hw2reg.ip7.p15.de = 1'b1; // Always write
+  assign hw2reg.ip7.p16.de = 1'b1; // Always write
+  assign hw2reg.ip7.p17.de = 1'b1; // Always write
+  assign hw2reg.ip7.p18.de = 1'b1; // Always write
+  assign hw2reg.ip7.p19.de = 1'b1; // Always write
+  assign hw2reg.ip7.p20.de = 1'b1; // Always write
+  assign hw2reg.ip7.p21.de = 1'b1; // Always write
+  assign hw2reg.ip7.p22.de = 1'b1; // Always write
+  assign hw2reg.ip7.p23.de = 1'b1; // Always write
+  assign hw2reg.ip7.p24.de = 1'b1; // Always write
+  assign hw2reg.ip7.p25.de = 1'b1; // Always write
+  assign hw2reg.ip7.p26.de = 1'b1; // Always write
+  assign hw2reg.ip7.p27.de = 1'b1; // Always write
+  assign hw2reg.ip7.p28.de = 1'b1; // Always write
+  assign hw2reg.ip7.p29.de = 1'b1; // Always write
+  assign hw2reg.ip7.p30.de = 1'b1; // Always write
+  assign hw2reg.ip7.p31.de = 1'b1; // Always write
+  assign hw2reg.ip.p0.d  = ip[0];
+  assign hw2reg.ip.p1.d  = ip[1];
+  assign hw2reg.ip.p2.d  = ip[2];
+  assign hw2reg.ip.p3.d  = ip[3];
+  assign hw2reg.ip.p4.d  = ip[4];
+  assign hw2reg.ip.p5.d  = ip[5];
+  assign hw2reg.ip.p6.d  = ip[6];
+  assign hw2reg.ip.p7.d  = ip[7];
+  assign hw2reg.ip.p8.d  = ip[8];
+  assign hw2reg.ip.p9.d  = ip[9];
+  assign hw2reg.ip.p10.d  = ip[10];
+  assign hw2reg.ip.p11.d  = ip[11];
+  assign hw2reg.ip.p12.d  = ip[12];
+  assign hw2reg.ip.p13.d  = ip[13];
+  assign hw2reg.ip.p14.d  = ip[14];
+  assign hw2reg.ip.p15.d  = ip[15];
+  assign hw2reg.ip.p16.d  = ip[16];
+  assign hw2reg.ip.p17.d  = ip[17];
+  assign hw2reg.ip.p18.d  = ip[18];
+  assign hw2reg.ip.p19.d  = ip[19];
+  assign hw2reg.ip.p20.d  = ip[20];
+  assign hw2reg.ip.p21.d  = ip[21];
+  assign hw2reg.ip.p22.d  = ip[22];
+  assign hw2reg.ip.p23.d  = ip[23];
+  assign hw2reg.ip.p24.d  = ip[24];
+  assign hw2reg.ip.p25.d  = ip[25];
+  assign hw2reg.ip.p26.d  = ip[26];
+  assign hw2reg.ip.p27.d  = ip[27];
+  assign hw2reg.ip.p28.d  = ip[28];
+  assign hw2reg.ip.p29.d  = ip[29];
+  assign hw2reg.ip.p30.d  = ip[30];
+  assign hw2reg.ip.p31.d  = ip[31];
+  assign hw2reg.ip.p32.d  = ip[32];
+  assign hw2reg.ip1.p1.d  = ip[33];
+  assign hw2reg.ip1.p2.d  = ip[34];
+  assign hw2reg.ip1.p3.d  = ip[35];
+  assign hw2reg.ip1.p4.d  = ip[36];
+  assign hw2reg.ip1.p5.d  = ip[37];
+  assign hw2reg.ip1.p6.d  = ip[38];
+  assign hw2reg.ip1.p7.d  = ip[39];
+  assign hw2reg.ip1.p8.d  = ip[40];
+  assign hw2reg.ip1.p9.d  = ip[41];
+  assign hw2reg.ip1.p10.d  = ip[42];
+  assign hw2reg.ip1.p11.d  = ip[43];
+  assign hw2reg.ip1.p12.d  = ip[44];
+  assign hw2reg.ip1.p13.d  = ip[45];
+  assign hw2reg.ip1.p14.d  = ip[46];
+  assign hw2reg.ip1.p15.d  = ip[47];
+  assign hw2reg.ip1.p16.d  = ip[48];
+  assign hw2reg.ip1.p17.d  = ip[49];
+  assign hw2reg.ip1.p18.d  = ip[50];
+  assign hw2reg.ip1.p19.d  = ip[51];
+  assign hw2reg.ip1.p20.d  = ip[52];
+  assign hw2reg.ip1.p21.d  = ip[53];
+  assign hw2reg.ip1.p22.d  = ip[54];
+  assign hw2reg.ip1.p23.d  = ip[55];
+  assign hw2reg.ip1.p24.d  = ip[56];
+  assign hw2reg.ip1.p25.d  = ip[57];
+  assign hw2reg.ip1.p26.d  = ip[58];
+  assign hw2reg.ip1.p27.d  = ip[59];
+  assign hw2reg.ip1.p28.d  = ip[60];
+  assign hw2reg.ip1.p29.d  = ip[61];
+  assign hw2reg.ip1.p30.d  = ip[62];
+  assign hw2reg.ip1.p31.d  = ip[63];
+  assign hw2reg.ip2.p0.d  = ip[64];
+  assign hw2reg.ip2.p1.d  = ip[65];
+  assign hw2reg.ip2.p2.d  = ip[66];
+  assign hw2reg.ip2.p3.d  = ip[67];
+  assign hw2reg.ip2.p4.d  = ip[68];
+  assign hw2reg.ip2.p5.d  = ip[69];
+  assign hw2reg.ip2.p6.d  = ip[70];
+  assign hw2reg.ip2.p7.d  = ip[71];
+  assign hw2reg.ip2.p8.d  = ip[72];
+  assign hw2reg.ip2.p9.d  = ip[73];
+  assign hw2reg.ip2.p10.d  = ip[74];
+  assign hw2reg.ip2.p11.d  = ip[75];
+  assign hw2reg.ip2.p12.d  = ip[76];
+  assign hw2reg.ip2.p13.d  = ip[77];
+  assign hw2reg.ip2.p14.d  = ip[78];
+  assign hw2reg.ip2.p15.d  = ip[79];
+  assign hw2reg.ip2.p16.d  = ip[80];
+  assign hw2reg.ip2.p17.d  = ip[81];
+  assign hw2reg.ip2.p18.d  = ip[82];
+  assign hw2reg.ip2.p19.d  = ip[83];
+  assign hw2reg.ip2.p20.d  = ip[84];
+  assign hw2reg.ip2.p21.d  = ip[85];
+  assign hw2reg.ip2.p22.d  = ip[86];
+  assign hw2reg.ip2.p23.d  = ip[87];
+  assign hw2reg.ip2.p24.d  = ip[88];
+  assign hw2reg.ip2.p25.d  = ip[89];
+  assign hw2reg.ip2.p26.d  = ip[90];
+  assign hw2reg.ip2.p27.d  = ip[91];
+  assign hw2reg.ip2.p28.d  = ip[92];
+  assign hw2reg.ip2.p29.d  = ip[93];
+  assign hw2reg.ip2.p30.d  = ip[94];
+  assign hw2reg.ip2.p31.d  = ip[95];
+  assign hw2reg.ip3.p0.d  = ip[96];
+  assign hw2reg.ip3.p1.d  = ip[97];
+  assign hw2reg.ip3.p2.d  = ip[98];
+  assign hw2reg.ip3.p3.d  = ip[99];
+  assign hw2reg.ip3.p4.d  = ip[100];
+  assign hw2reg.ip3.p5.d  = ip[101];
+  assign hw2reg.ip3.p6.d  = ip[102];
+  assign hw2reg.ip3.p7.d  = ip[103];
+  assign hw2reg.ip3.p8.d  = ip[104];
+  assign hw2reg.ip3.p9.d  = ip[105];
+  assign hw2reg.ip3.p10.d  = ip[106];
+  assign hw2reg.ip3.p11.d  = ip[107];
+  assign hw2reg.ip3.p12.d  = ip[108];
+  assign hw2reg.ip3.p13.d  = ip[109];
+  assign hw2reg.ip3.p14.d  = ip[110];
+  assign hw2reg.ip3.p15.d  = ip[111];
+  assign hw2reg.ip3.p16.d  = ip[112];
+  assign hw2reg.ip3.p17.d  = ip[113];
+  assign hw2reg.ip3.p18.d  = ip[114];
+  assign hw2reg.ip3.p19.d  = ip[115];
+  assign hw2reg.ip3.p20.d  = ip[116];
+  assign hw2reg.ip3.p21.d  = ip[117];
+  assign hw2reg.ip3.p22.d  = ip[118];
+  assign hw2reg.ip3.p23.d  = ip[119];
+  assign hw2reg.ip3.p24.d  = ip[120];
+  assign hw2reg.ip3.p25.d  = ip[121];
+  assign hw2reg.ip3.p26.d  = ip[122];
+  assign hw2reg.ip3.p27.d  = ip[123];
+  assign hw2reg.ip3.p28.d  = ip[124];
+  assign hw2reg.ip3.p29.d  = ip[125];
+  assign hw2reg.ip3.p30.d  = ip[126];
+  assign hw2reg.ip3.p31.d  = ip[127];
+  assign hw2reg.ip4.p0.d  = ip[128];
+  assign hw2reg.ip4.p1.d  = ip[129];
+  assign hw2reg.ip4.p2.d  = ip[130];
+  assign hw2reg.ip4.p3.d  = ip[131];
+  assign hw2reg.ip4.p4.d  = ip[132];
+  assign hw2reg.ip4.p5.d  = ip[133];
+  assign hw2reg.ip4.p6.d  = ip[134];
+  assign hw2reg.ip4.p7.d  = ip[135];
+  assign hw2reg.ip4.p8.d  = ip[136];
+  assign hw2reg.ip4.p9.d  = ip[137];
+  assign hw2reg.ip4.p10.d  = ip[138];
+  assign hw2reg.ip4.p11.d  = ip[139];
+  assign hw2reg.ip4.p12.d  = ip[140];
+  assign hw2reg.ip4.p13.d  = ip[141];
+  assign hw2reg.ip4.p14.d  = ip[142];
+  assign hw2reg.ip4.p15.d  = ip[143];
+  assign hw2reg.ip4.p16.d  = ip[144];
+  assign hw2reg.ip4.p17.d  = ip[145];
+  assign hw2reg.ip4.p18.d  = ip[146];
+  assign hw2reg.ip4.p19.d  = ip[147];
+  assign hw2reg.ip4.p20.d  = ip[148];
+  assign hw2reg.ip4.p21.d  = ip[149];
+  assign hw2reg.ip4.p22.d  = ip[150];
+  assign hw2reg.ip4.p23.d  = ip[151];
+  assign hw2reg.ip4.p24.d  = ip[152];
+  assign hw2reg.ip4.p25.d  = ip[153];
+  assign hw2reg.ip4.p26.d  = ip[154];
+  assign hw2reg.ip4.p27.d  = ip[155];
+  assign hw2reg.ip4.p28.d  = ip[156];
+  assign hw2reg.ip4.p29.d  = ip[157];
+  assign hw2reg.ip4.p30.d  = ip[158];
+  assign hw2reg.ip4.p31.d  = ip[159];
+  assign hw2reg.ip5.p0.d  = ip[160];
+  assign hw2reg.ip5.p1.d  = ip[161];
+  assign hw2reg.ip5.p2.d  = ip[162];
+  assign hw2reg.ip5.p3.d  = ip[163];
+  assign hw2reg.ip5.p4.d  = ip[164];
+  assign hw2reg.ip5.p5.d  = ip[165];
+  assign hw2reg.ip5.p6.d  = ip[166];
+  assign hw2reg.ip5.p7.d  = ip[167];
+  assign hw2reg.ip5.p8.d  = ip[168];
+  assign hw2reg.ip5.p9.d  = ip[169];
+  assign hw2reg.ip5.p10.d  = ip[170];
+  assign hw2reg.ip5.p11.d  = ip[171];
+  assign hw2reg.ip5.p12.d  = ip[172];
+  assign hw2reg.ip5.p13.d  = ip[173];
+  assign hw2reg.ip5.p14.d  = ip[174];
+  assign hw2reg.ip5.p15.d  = ip[175];
+  assign hw2reg.ip5.p16.d  = ip[176];
+  assign hw2reg.ip5.p17.d  = ip[177];
+  assign hw2reg.ip5.p18.d  = ip[178];
+  assign hw2reg.ip5.p19.d  = ip[179];
+  assign hw2reg.ip5.p20.d  = ip[180];
+  assign hw2reg.ip5.p21.d  = ip[181];
+  assign hw2reg.ip5.p22.d  = ip[182];
+  assign hw2reg.ip5.p23.d  = ip[183];
+  assign hw2reg.ip5.p24.d  = ip[184];
+  assign hw2reg.ip5.p25.d  = ip[185];
+  assign hw2reg.ip5.p26.d  = ip[186];
+  assign hw2reg.ip5.p27.d  = ip[187];
+  assign hw2reg.ip5.p28.d  = ip[188];
+  assign hw2reg.ip5.p29.d  = ip[189];
+  assign hw2reg.ip5.p30.d  = ip[190];
+  assign hw2reg.ip5.p31.d  = ip[191];
+  assign hw2reg.ip6.p0.d  = ip[192];
+  assign hw2reg.ip6.p1.d  = ip[193];
+  assign hw2reg.ip6.p2.d  = ip[194];
+  assign hw2reg.ip6.p3.d  = ip[195];
+  assign hw2reg.ip6.p4.d  = ip[196];
+  assign hw2reg.ip6.p5.d  = ip[197];
+  assign hw2reg.ip6.p6.d  = ip[198];
+  assign hw2reg.ip6.p7.d  = ip[199];
+  assign hw2reg.ip6.p8.d  = ip[200];
+  assign hw2reg.ip6.p9.d  = ip[201];
+  assign hw2reg.ip6.p10.d  = ip[202];
+  assign hw2reg.ip6.p11.d  = ip[203];
+  assign hw2reg.ip6.p12.d  = ip[204];
+  assign hw2reg.ip6.p13.d  = ip[205];
+  assign hw2reg.ip6.p14.d  = ip[206];
+  assign hw2reg.ip6.p15.d  = ip[207];
+  assign hw2reg.ip6.p16.d  = ip[208];
+  assign hw2reg.ip6.p17.d  = ip[209];
+  assign hw2reg.ip6.p18.d  = ip[210];
+  assign hw2reg.ip6.p19.d  = ip[211];
+  assign hw2reg.ip6.p20.d  = ip[212];
+  assign hw2reg.ip6.p21.d  = ip[213];
+  assign hw2reg.ip6.p22.d  = ip[214];
+  assign hw2reg.ip6.p23.d  = ip[215];
+  assign hw2reg.ip6.p24.d  = ip[216];
+  assign hw2reg.ip6.p25.d  = ip[217];
+  assign hw2reg.ip6.p26.d  = ip[218];
+  assign hw2reg.ip6.p27.d  = ip[219];
+  assign hw2reg.ip6.p28.d  = ip[220];
+  assign hw2reg.ip6.p29.d  = ip[221];
+  assign hw2reg.ip6.p30.d  = ip[222];
+  assign hw2reg.ip6.p31.d  = ip[223];
+  assign hw2reg.ip7.p0.d  = ip[224];
+  assign hw2reg.ip7.p1.d  = ip[225];
+  assign hw2reg.ip7.p2.d  = ip[226];
+  assign hw2reg.ip7.p3.d  = ip[227];
+  assign hw2reg.ip7.p4.d  = ip[228];
+  assign hw2reg.ip7.p5.d  = ip[229];
+  assign hw2reg.ip7.p6.d  = ip[230];
+  assign hw2reg.ip7.p7.d  = ip[231];
+  assign hw2reg.ip7.p8.d  = ip[232];
+  assign hw2reg.ip7.p9.d  = ip[233];
+  assign hw2reg.ip7.p10.d  = ip[234];
+  assign hw2reg.ip7.p11.d  = ip[235];
+  assign hw2reg.ip7.p12.d  = ip[236];
+  assign hw2reg.ip7.p13.d  = ip[237];
+  assign hw2reg.ip7.p14.d  = ip[238];
+  assign hw2reg.ip7.p15.d  = ip[239];
+  assign hw2reg.ip7.p16.d  = ip[240];
+  assign hw2reg.ip7.p17.d  = ip[241];
+  assign hw2reg.ip7.p18.d  = ip[242];
+  assign hw2reg.ip7.p19.d  = ip[243];
+  assign hw2reg.ip7.p20.d  = ip[244];
+  assign hw2reg.ip7.p21.d  = ip[245];
+  assign hw2reg.ip7.p22.d  = ip[246];
+  assign hw2reg.ip7.p23.d  = ip[247];
+  assign hw2reg.ip7.p24.d  = ip[248];
+  assign hw2reg.ip7.p25.d  = ip[249];
+  assign hw2reg.ip7.p26.d  = ip[250];
+  assign hw2reg.ip7.p27.d  = ip[251];
+  assign hw2reg.ip7.p28.d  = ip[252];
+  assign hw2reg.ip7.p29.d  = ip[253];
+  assign hw2reg.ip7.p30.d  = ip[254];
+  assign hw2reg.ip7.p31.d  = ip[255];
+  //----------------------------------------------------------------------------
 
-assign hw2reg.cc0.d  = cc_id[0];
-//------------------------------------------------------------------------------
+  //////////////////////////////////////////////////////////////////////////////
+  // Detection:: 0: Level, 1: Edge
+  assign le[0] = reg2hw.le.le0.q;
+  assign le[1] = reg2hw.le.le1.q;
+  assign le[2] = reg2hw.le.le2.q;
+  assign le[3] = reg2hw.le.le3.q;
+  assign le[4] = reg2hw.le.le4.q;
+  assign le[5] = reg2hw.le.le5.q;
+  assign le[6] = reg2hw.le.le6.q;
+  assign le[7] = reg2hw.le.le7.q;
+  assign le[8] = reg2hw.le.le8.q;
+  assign le[9] = reg2hw.le.le9.q;
+  assign le[10] = reg2hw.le.le10.q;
+  assign le[11] = reg2hw.le.le11.q;
+  assign le[12] = reg2hw.le.le12.q;
+  assign le[13] = reg2hw.le.le13.q;
+  assign le[14] = reg2hw.le.le14.q;
+  assign le[15] = reg2hw.le.le15.q;
+  assign le[16] = reg2hw.le.le16.q;
+  assign le[17] = reg2hw.le.le17.q;
+  assign le[18] = reg2hw.le.le18.q;
+  assign le[19] = reg2hw.le.le19.q;
+  assign le[20] = reg2hw.le.le20.q;
+  assign le[21] = reg2hw.le.le21.q;
+  assign le[22] = reg2hw.le.le22.q;
+  assign le[23] = reg2hw.le.le23.q;
+  assign le[24] = reg2hw.le.le24.q;
+  assign le[25] = reg2hw.le.le25.q;
+  assign le[26] = reg2hw.le.le26.q;
+  assign le[27] = reg2hw.le.le27.q;
+  assign le[28] = reg2hw.le.le28.q;
+  assign le[29] = reg2hw.le.le29.q;
+  assign le[30] = reg2hw.le.le30.q;
+  assign le[31] = reg2hw.le.le31.q;
+  assign le[32] = reg2hw.le.le32.q;
+  assign le[33] = reg2hw.le1.le1.q;
+  assign le[34] = reg2hw.le1.le2.q;
+  assign le[35] = reg2hw.le1.le3.q;
+  assign le[36] = reg2hw.le1.le4.q;
+  assign le[37] = reg2hw.le1.le5.q;
+  assign le[38] = reg2hw.le1.le6.q;
+  assign le[39] = reg2hw.le1.le7.q;
+  assign le[40] = reg2hw.le1.le8.q;
+  assign le[41] = reg2hw.le1.le9.q;
+  assign le[42] = reg2hw.le1.le10.q;
+  assign le[43] = reg2hw.le1.le11.q;
+  assign le[44] = reg2hw.le1.le12.q;
+  assign le[45] = reg2hw.le1.le13.q;
+  assign le[46] = reg2hw.le1.le14.q;
+  assign le[47] = reg2hw.le1.le15.q;
+  assign le[48] = reg2hw.le1.le16.q;
+  assign le[49] = reg2hw.le1.le17.q;
+  assign le[50] = reg2hw.le1.le18.q;
+  assign le[51] = reg2hw.le1.le19.q;
+  assign le[52] = reg2hw.le1.le20.q;
+  assign le[53] = reg2hw.le1.le21.q;
+  assign le[54] = reg2hw.le1.le22.q;
+  assign le[55] = reg2hw.le1.le23.q;
+  assign le[56] = reg2hw.le1.le24.q;
+  assign le[57] = reg2hw.le1.le25.q;
+  assign le[58] = reg2hw.le1.le26.q;
+  assign le[59] = reg2hw.le1.le27.q;
+  assign le[60] = reg2hw.le1.le28.q;
+  assign le[61] = reg2hw.le1.le29.q;
+  assign le[62] = reg2hw.le1.le30.q;
+  assign le[63] = reg2hw.le1.le31.q;
+  assign le[64] = reg2hw.le2.le0.q;
+  assign le[65] = reg2hw.le2.le1.q;
+  assign le[66] = reg2hw.le2.le2.q;
+  assign le[67] = reg2hw.le2.le3.q;
+  assign le[68] = reg2hw.le2.le4.q;
+  assign le[69] = reg2hw.le2.le5.q;
+  assign le[70] = reg2hw.le2.le6.q;
+  assign le[71] = reg2hw.le2.le7.q;
+  assign le[72] = reg2hw.le2.le8.q;
+  assign le[73] = reg2hw.le2.le9.q;
+  assign le[74] = reg2hw.le2.le10.q;
+  assign le[75] = reg2hw.le2.le11.q;
+  assign le[76] = reg2hw.le2.le12.q;
+  assign le[77] = reg2hw.le2.le13.q;
+  assign le[78] = reg2hw.le2.le14.q;
+  assign le[79] = reg2hw.le2.le15.q;
+  assign le[80] = reg2hw.le2.le16.q;
+  assign le[81] = reg2hw.le2.le17.q;
+  assign le[82] = reg2hw.le2.le18.q;
+  assign le[83] = reg2hw.le2.le19.q;
+  assign le[84] = reg2hw.le2.le20.q;
+  assign le[85] = reg2hw.le2.le21.q;
+  assign le[86] = reg2hw.le2.le22.q;
+  assign le[87] = reg2hw.le2.le23.q;
+  assign le[88] = reg2hw.le2.le24.q;
+  assign le[89] = reg2hw.le2.le25.q;
+  assign le[90] = reg2hw.le2.le26.q;
+  assign le[91] = reg2hw.le2.le27.q;
+  assign le[92] = reg2hw.le2.le28.q;
+  assign le[93] = reg2hw.le2.le29.q;
+  assign le[94] = reg2hw.le2.le30.q;
+  assign le[95] = reg2hw.le2.le31.q;
+  assign le[96] = reg2hw.le3.le0.q;
+  assign le[97] = reg2hw.le3.le1.q;
+  assign le[98] = reg2hw.le3.le2.q;
+  assign le[99] = reg2hw.le3.le3.q;
+  assign le[100] = reg2hw.le3.le4.q;
+  assign le[101] = reg2hw.le3.le5.q;
+  assign le[102] = reg2hw.le3.le6.q;
+  assign le[103] = reg2hw.le3.le7.q;
+  assign le[104] = reg2hw.le3.le8.q;
+  assign le[105] = reg2hw.le3.le9.q;
+  assign le[106] = reg2hw.le3.le10.q;
+  assign le[107] = reg2hw.le3.le11.q;
+  assign le[108] = reg2hw.le3.le12.q;
+  assign le[109] = reg2hw.le3.le13.q;
+  assign le[110] = reg2hw.le3.le14.q;
+  assign le[111] = reg2hw.le3.le15.q;
+  assign le[112] = reg2hw.le3.le16.q;
+  assign le[113] = reg2hw.le3.le17.q;
+  assign le[114] = reg2hw.le3.le18.q;
+  assign le[115] = reg2hw.le3.le19.q;
+  assign le[116] = reg2hw.le3.le20.q;
+  assign le[117] = reg2hw.le3.le21.q;
+  assign le[118] = reg2hw.le3.le22.q;
+  assign le[119] = reg2hw.le3.le23.q;
+  assign le[120] = reg2hw.le3.le24.q;
+  assign le[121] = reg2hw.le3.le25.q;
+  assign le[122] = reg2hw.le3.le26.q;
+  assign le[123] = reg2hw.le3.le27.q;
+  assign le[124] = reg2hw.le3.le28.q;
+  assign le[125] = reg2hw.le3.le29.q;
+  assign le[126] = reg2hw.le3.le30.q;
+  assign le[127] = reg2hw.le3.le31.q;
+  assign le[128] = reg2hw.le4.le0.q;
+  assign le[129] = reg2hw.le4.le1.q;
+  assign le[130] = reg2hw.le4.le2.q;
+  assign le[131] = reg2hw.le4.le3.q;
+  assign le[132] = reg2hw.le4.le4.q;
+  assign le[133] = reg2hw.le4.le5.q;
+  assign le[134] = reg2hw.le4.le6.q;
+  assign le[135] = reg2hw.le4.le7.q;
+  assign le[136] = reg2hw.le4.le8.q;
+  assign le[137] = reg2hw.le4.le9.q;
+  assign le[138] = reg2hw.le4.le10.q;
+  assign le[139] = reg2hw.le4.le11.q;
+  assign le[140] = reg2hw.le4.le12.q;
+  assign le[141] = reg2hw.le4.le13.q;
+  assign le[142] = reg2hw.le4.le14.q;
+  assign le[143] = reg2hw.le4.le15.q;
+  assign le[144] = reg2hw.le4.le16.q;
+  assign le[145] = reg2hw.le4.le17.q;
+  assign le[146] = reg2hw.le4.le18.q;
+  assign le[147] = reg2hw.le4.le19.q;
+  assign le[148] = reg2hw.le4.le20.q;
+  assign le[149] = reg2hw.le4.le21.q;
+  assign le[150] = reg2hw.le4.le22.q;
+  assign le[151] = reg2hw.le4.le23.q;
+  assign le[152] = reg2hw.le4.le24.q;
+  assign le[153] = reg2hw.le4.le25.q;
+  assign le[154] = reg2hw.le4.le26.q;
+  assign le[155] = reg2hw.le4.le27.q;
+  assign le[156] = reg2hw.le4.le28.q;
+  assign le[157] = reg2hw.le4.le29.q;
+  assign le[158] = reg2hw.le4.le30.q;
+  assign le[159] = reg2hw.le4.le31.q;
+  assign le[160] = reg2hw.le5.le0.q;
+  assign le[161] = reg2hw.le5.le1.q;
+  assign le[162] = reg2hw.le5.le2.q;
+  assign le[163] = reg2hw.le5.le3.q;
+  assign le[164] = reg2hw.le5.le4.q;
+  assign le[165] = reg2hw.le5.le5.q;
+  assign le[166] = reg2hw.le5.le6.q;
+  assign le[167] = reg2hw.le5.le7.q;
+  assign le[168] = reg2hw.le5.le8.q;
+  assign le[169] = reg2hw.le5.le9.q;
+  assign le[170] = reg2hw.le5.le10.q;
+  assign le[171] = reg2hw.le5.le11.q;
+  assign le[172] = reg2hw.le5.le12.q;
+  assign le[173] = reg2hw.le5.le13.q;
+  assign le[174] = reg2hw.le5.le14.q;
+  assign le[175] = reg2hw.le5.le15.q;
+  assign le[176] = reg2hw.le5.le16.q;
+  assign le[177] = reg2hw.le5.le17.q;
+  assign le[178] = reg2hw.le5.le18.q;
+  assign le[179] = reg2hw.le5.le19.q;
+  assign le[180] = reg2hw.le5.le20.q;
+  assign le[181] = reg2hw.le5.le21.q;
+  assign le[182] = reg2hw.le5.le22.q;
+  assign le[183] = reg2hw.le5.le23.q;
+  assign le[184] = reg2hw.le5.le24.q;
+  assign le[185] = reg2hw.le5.le25.q;
+  assign le[186] = reg2hw.le5.le26.q;
+  assign le[187] = reg2hw.le5.le27.q;
+  assign le[188] = reg2hw.le5.le28.q;
+  assign le[189] = reg2hw.le5.le29.q;
+  assign le[190] = reg2hw.le5.le30.q;
+  assign le[191] = reg2hw.le5.le31.q;
+  assign le[192] = reg2hw.le6.le0.q;
+  assign le[193] = reg2hw.le6.le1.q;
+  assign le[194] = reg2hw.le6.le2.q;
+  assign le[195] = reg2hw.le6.le3.q;
+  assign le[196] = reg2hw.le6.le4.q;
+  assign le[197] = reg2hw.le6.le5.q;
+  assign le[198] = reg2hw.le6.le6.q;
+  assign le[199] = reg2hw.le6.le7.q;
+  assign le[200] = reg2hw.le6.le8.q;
+  assign le[201] = reg2hw.le6.le9.q;
+  assign le[202] = reg2hw.le6.le10.q;
+  assign le[203] = reg2hw.le6.le11.q;
+  assign le[204] = reg2hw.le6.le12.q;
+  assign le[205] = reg2hw.le6.le13.q;
+  assign le[206] = reg2hw.le6.le14.q;
+  assign le[207] = reg2hw.le6.le15.q;
+  assign le[208] = reg2hw.le6.le16.q;
+  assign le[209] = reg2hw.le6.le17.q;
+  assign le[210] = reg2hw.le6.le18.q;
+  assign le[211] = reg2hw.le6.le19.q;
+  assign le[212] = reg2hw.le6.le20.q;
+  assign le[213] = reg2hw.le6.le21.q;
+  assign le[214] = reg2hw.le6.le22.q;
+  assign le[215] = reg2hw.le6.le23.q;
+  assign le[216] = reg2hw.le6.le24.q;
+  assign le[217] = reg2hw.le6.le25.q;
+  assign le[218] = reg2hw.le6.le26.q;
+  assign le[219] = reg2hw.le6.le27.q;
+  assign le[220] = reg2hw.le6.le28.q;
+  assign le[221] = reg2hw.le6.le29.q;
+  assign le[222] = reg2hw.le6.le30.q;
+  assign le[223] = reg2hw.le6.le31.q;
+  assign le[224] = reg2hw.le7.le0.q;
+  assign le[225] = reg2hw.le7.le1.q;
+  assign le[226] = reg2hw.le7.le2.q;
+  assign le[227] = reg2hw.le7.le3.q;
+  assign le[228] = reg2hw.le7.le4.q;
+  assign le[229] = reg2hw.le7.le5.q;
+  assign le[230] = reg2hw.le7.le6.q;
+  assign le[231] = reg2hw.le7.le7.q;
+  assign le[232] = reg2hw.le7.le8.q;
+  assign le[233] = reg2hw.le7.le9.q;
+  assign le[234] = reg2hw.le7.le10.q;
+  assign le[235] = reg2hw.le7.le11.q;
+  assign le[236] = reg2hw.le7.le12.q;
+  assign le[237] = reg2hw.le7.le13.q;
+  assign le[238] = reg2hw.le7.le14.q;
+  assign le[239] = reg2hw.le7.le15.q;
+  assign le[240] = reg2hw.le7.le16.q;
+  assign le[241] = reg2hw.le7.le17.q;
+  assign le[242] = reg2hw.le7.le18.q;
+  assign le[243] = reg2hw.le7.le19.q;
+  assign le[244] = reg2hw.le7.le20.q;
+  assign le[245] = reg2hw.le7.le21.q;
+  assign le[246] = reg2hw.le7.le22.q;
+  assign le[247] = reg2hw.le7.le23.q;
+  assign le[248] = reg2hw.le7.le24.q;
+  assign le[249] = reg2hw.le7.le25.q;
+  assign le[250] = reg2hw.le7.le26.q;
+  assign le[251] = reg2hw.le7.le27.q;
+  assign le[252] = reg2hw.le7.le28.q;
+  assign le[253] = reg2hw.le7.le29.q;
+  assign le[254] = reg2hw.le7.le30.q;
+  assign le[255] = reg2hw.le7.le31.q;
+  //----------------------------------------------------------------------------
 
-////////////////////////////////////////////////////////////////////////////////
-// IP : Need to connect manually
-assign hw2reg.ip.p0.de = 1'b1; // Always write
-assign hw2reg.ip.p1.de = 1'b1; // Always write
-assign hw2reg.ip.p2.de = 1'b1; // Always write
-assign hw2reg.ip.p3.de = 1'b1; // Always write
-assign hw2reg.ip.p4.de = 1'b1; // Always write
-assign hw2reg.ip.p5.de = 1'b1; // Always write
-assign hw2reg.ip.p6.de = 1'b1; // Always write
-assign hw2reg.ip.p7.de = 1'b1; // Always write
-assign hw2reg.ip.p8.de = 1'b1; // Always write
-assign hw2reg.ip.p9.de = 1'b1; // Always write
-assign hw2reg.ip.p10.de = 1'b1; // Always write
-assign hw2reg.ip.p11.de = 1'b1; // Always write
-assign hw2reg.ip.p12.de = 1'b1; // Always write
-assign hw2reg.ip.p13.de = 1'b1; // Always write
-assign hw2reg.ip.p14.de = 1'b1; // Always write
-assign hw2reg.ip.p15.de = 1'b1; // Always write
-assign hw2reg.ip.p16.de = 1'b1; // Always write
-assign hw2reg.ip.p17.de = 1'b1; // Always write
-assign hw2reg.ip.p18.de = 1'b1; // Always write
-assign hw2reg.ip.p19.de = 1'b1; // Always write
-assign hw2reg.ip.p20.de = 1'b1; // Always write
-assign hw2reg.ip.p21.de = 1'b1; // Always write
-assign hw2reg.ip.p22.de = 1'b1; // Always write
-assign hw2reg.ip.p23.de = 1'b1; // Always write
-assign hw2reg.ip.p24.de = 1'b1; // Always write
-assign hw2reg.ip.p25.de = 1'b1; // Always write
-assign hw2reg.ip.p26.de = 1'b1; // Always write
-assign hw2reg.ip.p27.de = 1'b1; // Always write
-assign hw2reg.ip.p28.de = 1'b1; // Always write
-assign hw2reg.ip.p29.de = 1'b1; // Always write
-assign hw2reg.ip.p30.de = 1'b1; // Always write
-assign hw2reg.ip.p31.de = 1'b1; // Always write
-assign hw2reg.ip.p0.d  = ip[0];
-assign hw2reg.ip.p1.d  = ip[1];
-assign hw2reg.ip.p2.d  = ip[2];
-assign hw2reg.ip.p3.d  = ip[3];
-assign hw2reg.ip.p4.d  = ip[4];
-assign hw2reg.ip.p5.d  = ip[5];
-assign hw2reg.ip.p6.d  = ip[6];
-assign hw2reg.ip.p7.d  = ip[7];
-assign hw2reg.ip.p8.d  = ip[8];
-assign hw2reg.ip.p9.d  = ip[9];
-assign hw2reg.ip.p10.d  = ip[10];
-assign hw2reg.ip.p11.d  = ip[11];
-assign hw2reg.ip.p12.d  = ip[12];
-assign hw2reg.ip.p13.d  = ip[13];
-assign hw2reg.ip.p14.d  = ip[14];
-assign hw2reg.ip.p15.d  = ip[15];
-assign hw2reg.ip.p16.d  = ip[16];
-assign hw2reg.ip.p17.d  = ip[17];
-assign hw2reg.ip.p18.d  = ip[18];
-assign hw2reg.ip.p19.d  = ip[19];
-assign hw2reg.ip.p20.d  = ip[20];
-assign hw2reg.ip.p21.d  = ip[21];
-assign hw2reg.ip.p22.d  = ip[22];
-assign hw2reg.ip.p23.d  = ip[23];
-assign hw2reg.ip.p24.d  = ip[24];
-assign hw2reg.ip.p25.d  = ip[25];
-assign hw2reg.ip.p26.d  = ip[26];
-assign hw2reg.ip.p27.d  = ip[27];
-assign hw2reg.ip.p28.d  = ip[28];
-assign hw2reg.ip.p29.d  = ip[29];
-assign hw2reg.ip.p30.d  = ip[30];
-assign hw2reg.ip.p31.d  = ip[31];
-//------------------------------------------------------------------------------
-
-////////////////////////////////////////////////////////////////////////////////
-// LE : Need to connect manually
-assign le[0] = reg2hw.le.le0.q;
-assign le[1] = reg2hw.le.le1.q;
-assign le[2] = reg2hw.le.le2.q;
-assign le[3] = reg2hw.le.le3.q;
-assign le[4] = reg2hw.le.le4.q;
-assign le[5] = reg2hw.le.le5.q;
-assign le[6] = reg2hw.le.le6.q;
-assign le[7] = reg2hw.le.le7.q;
-assign le[8] = reg2hw.le.le8.q;
-assign le[9] = reg2hw.le.le9.q;
-assign le[10] = reg2hw.le.le10.q;
-assign le[11] = reg2hw.le.le11.q;
-assign le[12] = reg2hw.le.le12.q;
-assign le[13] = reg2hw.le.le13.q;
-assign le[14] = reg2hw.le.le14.q;
-assign le[15] = reg2hw.le.le15.q;
-assign le[16] = reg2hw.le.le16.q;
-assign le[17] = reg2hw.le.le17.q;
-assign le[18] = reg2hw.le.le18.q;
-assign le[19] = reg2hw.le.le19.q;
-assign le[20] = reg2hw.le.le20.q;
-assign le[21] = reg2hw.le.le21.q;
-assign le[22] = reg2hw.le.le22.q;
-assign le[23] = reg2hw.le.le23.q;
-assign le[24] = reg2hw.le.le24.q;
-assign le[25] = reg2hw.le.le25.q;
-assign le[26] = reg2hw.le.le26.q;
-assign le[27] = reg2hw.le.le27.q;
-assign le[28] = reg2hw.le.le28.q;
-assign le[29] = reg2hw.le.le29.q;
-assign le[30] = reg2hw.le.le30.q;
-assign le[31] = reg2hw.le.le31.q;
-//------------------------------------------------------------------------------
-
-// Gateways
-rv_plic_gateway #(
-  .N_SOURCE (N_SOURCE)
-) u_gateway (
-  .clk_i,
-  .rst_ni,
-
-  .src (intr_src_i),
-  .le,
-
-  .claim,
-  .complete,
-
-  .ip
-);
-
-
-// Target interrupt notification
-for (genvar i = 0 ; i < N_TARGET ; i++) begin : gen_target
-  rv_plic_target #(
-    .N_SOURCE (N_SOURCE),
-    .MAX_PRIO (MAX_PRIO),
-    .ALGORITHM(FIND_MAX)
-  ) u_target (
+  // Gateways
+  rv_plic_gateway #(
+    .N_SOURCE (N_SOURCE)
+  ) u_gateway (
     .clk_i,
     .rst_ni,
 
-    .ip,
-    .ie        (ie[i]),
+    .src (intr_src_i),
+    .le,
 
-    .prio,
-    .threshold (threshold[i]),
+    .claim,
+    .complete,
 
-    .irq       (irq_o[i]),
-    .irq_id    (irq_id_o[i])
-
+    .ip
   );
-end
 
-// Register interface
-//  Limitation of register tool prevents the module from having flexibility to parameters
-//  So, signals are manually tied at the top.
-rv_plic_reg_top u_reg (
-  .clk_i,
-  .rst_ni,
 
-  .tl_i,
-  .tl_o,
+  // Target interrupt notification
+  for (genvar i = 0 ; i < N_TARGET ; i++) begin : gen_target
+    rv_plic_target #(
+      .N_SOURCE (N_SOURCE),
+      .MAX_PRIO (MAX_PRIO),
+      .ALGORITHM(FIND_MAX)
+    ) u_target (
+      .clk_i,
+      .rst_ni,
 
-  .reg2hw,
-  .hw2reg
-);
+      .ip,
+      .ie        (ie[i]),
+
+      .prio,
+      .threshold (threshold[i]),
+
+      .irq       (irq_o[i]),
+      .irq_id    (irq_id_o[i])
+
+    );
+  end
+
+  // Register interface
+  //  Limitation of register tool prevents the module from having flexibility to parameters
+  //  So, signals are manually tied at the top.
+  rv_plic_reg_top u_reg (
+    .clk_i,
+    .rst_ni,
+
+    .tl_i,
+    .tl_o,
+
+    .reg2hw,
+    .hw2reg
+  );
 
 endmodule
 
